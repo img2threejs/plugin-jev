@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "jev",
+  "version": "0.3.0",
+  "description": "Advisory checkpoint consultation and repair routing from structured img2 evidence using Jev TypeSafe; neither has acceptance authority.",
+  "capabilities": [{ "from": "repair-state", "to": "repair-recommendation" }, { "from": "img2.jev-checkpoint-context", "to": "img2.jev-checkpoint-advisory" }],
+  "requires": { "harness": ">=0.2.5", "coreApi": 1 }
+}

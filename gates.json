@@ -1,0 +1,8 @@
+[
+  {
+    "id": "jev-recommendation-integrity",
+    "command": "python3 {plugin_dir}/tools/gate_jev.py --workspace {workspace}",
+    "blocking": true,
+    "after": []
+  }
+]

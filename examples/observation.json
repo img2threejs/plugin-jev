@@ -1,0 +1,51 @@
+{
+  "kind": "img2.repair-observation",
+  "version": 1,
+  "state": {
+    "schemaVersion": "repair-state-v2",
+    "passId": "material",
+    "sceneKind": "room",
+    "focus": {"issueId": "jacket-finish", "componentIds": ["jacket"], "symptom": "Synthetic example: jacket renders glossy instead of matte", "requiredFeatureIds": ["finish"]},
+    "components": [{"id": "jacket", "role": "jacket shell", "parentId": null, "sharedResourceUsers": [], "protectedProperties": []}],
+    "specification": {
+      "requirements": [{"featureId": "finish", "statement": "Synthetic example: matte jacket", "evidenceIds": ["spec-finish"]}],
+      "implementationFacts": [{"id": "impl-finish", "source": "implementation", "kind": "observation", "statement": "Synthetic example: jacket roughness is 0.1"}]
+    },
+    "gates": [
+      {"id": "01-scene-classify", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "02-subject-inventory", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "03-placement-consistency", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "04-scale-anchors", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "05-occlusion", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "06-terrain-grounding", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "07-material-independence", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "08-multi-angle-legality", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "09-llm-vs-forge-agreement", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "10-code-only-contract", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "11-screenshot-gate", "status": "pass", "blocking": true, "coverage": "complete", "reasonCodes": [], "evidenceIds": ["build"]},
+      {"id": "12-ip-provenance-hygiene", "status": "fail", "blocking": true, "coverage": "complete", "reasonCodes": ["provenance-missing"], "evidenceIds": ["build"]}
+    ],
+    "evidence": {
+      "facts": [
+        {"id": "spec-finish", "source": "spec", "kind": "observation", "statement": "Synthetic example: matte jacket"},
+        {"id": "build", "source": "validator", "kind": "observation", "statement": "Synthetic example: typecheck passed"},
+        {"id": "visual", "source": "vision", "kind": "observation", "statement": "Synthetic example: controlled comparison shows jacket gloss unlike reference"}
+      ],
+      "missing": [], "comparison": "comparable", "conflicts": []
+    },
+    "recentAttempts": []
+  },
+  "control": {
+    "controllerStopped": false, "remainingBudgetUsd": 5, "remainingDeadlineMs": 60000,
+    "passCorrectionsUsed": 0, "totalCorrectionsUsed": 0, "passCorrectionLimit": 3,
+    "totalCorrectionLimit": 6, "evidenceJobsUsed": 0, "noProgressCount": 0, "oscillationDetected": false
+  },
+  "bindings": [
+    {"role": "reference", "path": "reference/front.png"},
+    {"role": "spec", "path": "object-sculpt-spec.json"},
+    {"role": "source", "path": "src/createCharacter.ts"},
+    {"role": "render-profile", "path": "render-profile.json"},
+    {"role": "evaluation", "path": "evaluation/review.json"},
+    {"role": "pipeline-state", "path": ".img2threejs/state.json"}
+  ]
+}

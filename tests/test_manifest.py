@@ -1,0 +1,18 @@
+import json
+import unittest
+from pathlib import Path
+
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+
+class ManifestContractTests(unittest.TestCase):
+    def test_requires_img2_harness_025_for_img2_jev_command(self):
+        manifest = json.loads((PLUGIN_DIR / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["requires"]["harness"], ">=0.2.5")
+        self.assertEqual(manifest["version"], "0.3.0")
+        self.assertIn({"from":"img2.jev-checkpoint-context","to":"img2.jev-checkpoint-advisory"}, manifest["capabilities"])
+
+
+if __name__ == "__main__":
+    unittest.main()

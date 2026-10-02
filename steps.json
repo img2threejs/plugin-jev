@@ -1,0 +1,23 @@
+[
+  {
+    "id": "jev-prepare-evidence",
+    "title": "Prepare bounded repair evidence after evaluation",
+    "actor": "agent",
+    "command": "Read {plugin_dir}/SKILL.md. After the existing pipeline admits and completes evaluation, prepare the img2.repair-observation artifact and bind its reference, spec, source, render profile, evaluation and pipeline-state files. Use the prepare command documented in the skill. Do not append the repair action until the advisory recommendation has been inspected. In shadow mode preserve the baseline decision.",
+    "after": []
+  },
+  {
+    "id": "jev-recommend",
+    "title": "Record a shadow repair recommendation",
+    "actor": "program",
+    "command": "python3 {plugin_dir}/tools/jev.py route --workspace {workspace}",
+    "after": ["jev-prepare-evidence"]
+  },
+  {
+    "id": "jev-review-recommendation",
+    "title": "Inspect advice without changing pipeline authority",
+    "actor": "agent",
+    "command": "Read the img2.repair-recommendation artifact under the workspace .img2/artifacts/jev directory. A shadow recommendation never changes the baseline; assist proposals require approval. Recheck the current pipeline gates and correction limits before recording its canonical action. Never treat the Jev artifact-integrity gate as visual, geometry or final acceptance.",
+    "after": ["jev-recommend"]
+  }
+]

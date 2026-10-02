@@ -1,0 +1,6 @@
+_img2_local.py
+__pycache__/
+*.py[cod]
+.img2/
+.env
+.env.*
