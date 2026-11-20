@@ -85,6 +85,11 @@ stores the key; the first live route verifies it. For automation, provide `TYPES
 the host secret manager; it takes precedence over the Keychain entry. No .env files are automatically
 sourced.
 
+Inspect local enrollment with `img2-jev auth-status`: exit 0 means a key is present, exit 3 means it
+is missing, and exit 1 means secure storage is inaccessible. The command never contacts TypeSafe or
+prints the key; a present key may still be rejected on the first provider call. Missing or rejected
+credentials require a user login prompt, not an automatic model fallback.
+
 Credential enrollment does not grant workspace disclosure consent; authorize each canonical workspace
 separately as described below.
 

@@ -6,6 +6,15 @@
 
 - Add a separate `jev consult` checkpoint-review route for aggregate-only inventory, scene-analysis, and production-brief receipts. It validates context digests and local bindings before and after one bounded TypeSafe dispatch, uses fixed checkpoint Choice questions, persists advisory-only content-addressed results, and never mutates the existing repair recommendation or gate state.
 - Require `jev-disclosure-v3` consent for the new pre-model checkpoint disclosure purpose; existing v2 grants require reauthorization.
+- Add local `auth-status` (0 present / 3 missing / 1 storage error), without exposing a credential or
+  contacting TypeSafe. Presence does not establish that TypeSafe accepts the key.
+- Add internal four-group decision question/response adapters and isolated image transport:
+  controlled disclosure, explicit unevaluated review evidence, EXIF-upright image preparation and
+  reversible Box coordinates, bounded HTTPS requests and separate credential-rejected outcomes.
+  Optional image support uses `requirements-decisions.txt`; the base core stays dependency-free.
+- The new modules are not automatically installed as capabilities or invoked by existing workflows.
+  Four-purpose consent, production pass wiring and live qualification remain separate integration
+  requirements; the legacy Environment-only repair/checkpoint contracts are unchanged.
 
 ### Changed
 

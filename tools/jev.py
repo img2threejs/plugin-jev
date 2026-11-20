@@ -29,7 +29,7 @@ from jev_policy import POLICY_VERSION, preflight, preflight_live, recommend, rec
 from jev_transport import evaluate_bounded
 from jev_outcome_report import build_report
 from jev_checkpoint import consult as consult_checkpoint
-from jev_auth import CredentialError, login as login_credential, resolve_api_key
+from jev_auth import CredentialError, auth_status, login as login_credential, resolve_api_key
 from jev_consent import POLICY_VERSION as CONSENT_POLICY_VERSION, ConsentError, require_consent, set_consent
 from jev_projection import POLICY_VERSION as PROJECTION_POLICY_VERSION, project_state
 
@@ -836,6 +836,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Advisory Jev repair routing; no scene mutations or acceptance authority.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("login", help="Store a TypeSafe API key in macOS Keychain")
+    commands.add_parser("auth-status", help="Report local credential presence without exposing the key")
     consent_command = commands.add_parser("consent", help="Authorize or revoke workspace disclosure")
     consent_command.add_argument("action", choices=("authorize", "revoke"))
     consent_command.add_argument("--workspace", default=None)
@@ -860,6 +861,10 @@ def main(argv=None):
             login_credential()
             emit({"kind": "img2.jev-command", "version": 1, "status": "credential-stored"})
             return 0
+        if args.command == "auth-status":
+            result = auth_status()
+            emit({"kind": "img2.jev-command", "version": 1, **result})
+            return {"present": 0, "missing": 3, "storage-error": 1}[result["status"]]
         workspace = resolve_workspace(args.workspace) if args.command != "consent" or args.workspace else resolve_workspace(None)
         if args.command == "consent":
             result = set_consent(workspace, args.action == "authorize")
