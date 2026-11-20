@@ -68,7 +68,7 @@ No questions are dropped or silently retried to fit; an oversized request fails 
 
 | Command | Context kind → declared advisory edge | Question set |
 |---|---|---|
-| `decision-routing` | `img2.route-context` → `img2.route-advisory` | `route-questions-v1` |
+| `decision-routing` | `img2.route-context` → `img2.route-advisory` | `route-questions-v2` |
 | `decision-build-strategy` | `img2.build-strategy-context` → `img2.build-strategy-advisory` | `strategy-questions-v1` |
 | `decision-quality-review` | `img2.quality-review-context` → `img2.quality-review-advisory` | `quality-review-questions-v1` |
 | `decision-repair` | `img2.repair-context` → `img2.repair-advisory` | `repair-decision-questions-v1` |
@@ -98,6 +98,8 @@ Collisions block dispatch; local asset ids, controller digests and path-based qu
 Routing Choice descriptions are fixed program text for `base-generic`, `interior`, `character`, `cs2`
 and `pixi2d`, never copied from candidate display/labels. Unknown routes and other groups retain the
 generic option description; these descriptions do not establish provider readiness or acceptance.
+Routing `crop-choice` instead compares `model-crop`/`jev-crop` for complete intended-object coverage
+and minimal unrelated content; unique matching images/bindings and the separate sufficiency Noul are required. Routing requires `route-questions-v2`; v1 contexts and cached advice are not reusable.
 Routing request disclosure preserves only expectedOutput `2d`/`3d`, intent `rig`, and an explicitRoute
 equal to one of those approved route ids. It is not full intent fidelity. Room/instance disclosure
 allows controlled roles, normalized boxes, opaque ids, numeric roomCount, enclosure `enclosed-room`

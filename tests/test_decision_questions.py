@@ -61,7 +61,7 @@ def response_for(context):
 
 class DecisionQuestionsTest(unittest.TestCase):
     def test_all_groups_are_usable_actual_typesafe_questions(self):
-        expected = {"routing": "route-questions-v1", "build-strategy": "strategy-questions-v1",
+        expected = {"routing": "route-questions-v2", "build-strategy": "strategy-questions-v1",
                     "quality-review": "quality-review-questions-v1", "repair": "repair-decision-questions-v1"}
         self.assertEqual(QUESTION_SET_VERSIONS, expected)
         for group in expected:
@@ -76,6 +76,17 @@ class DecisionQuestionsTest(unittest.TestCase):
                 response = response_for(context)
                 self.assertEqual(validate_answers(context, response), response)
 
+    def test_old_routing_question_set_has_no_compatibility_alias(self):
+        for context in (make_context(), self._crop_context()):
+            response = response_for(context)
+            self.assertEqual(context["questionSetVersion"], "route-questions-v2")
+            context["questionSetVersion"] = "route-questions-v1"
+            with self.subTest(pass_id=context["subject"]["passId"]):
+                with self.assertRaises(DecisionQuestionError):
+                    build_questions(context)
+                with self.assertRaises(DecisionQuestionError):
+                    validate_answers(context, response)
+
     def test_options_are_exactly_controller_candidates_and_have_companion_noul(self):
         for group in ("routing", "build-strategy", "repair"):
             context = make_context(group)
@@ -85,6 +96,115 @@ class DecisionQuestionsTest(unittest.TestCase):
             self.assertEqual(questions["anyFits"]["type"], "noul")
             context["candidates"] = [{"id": "only-eligible"}]
             self.assertEqual(set(build_questions(context)["selection"]["criteria"]), {"only-eligible"})
+
+    def _crop_context(self):
+        context = make_context()
+        context["subject"]["passId"] = "crop-choice"
+        context["candidates"] = [
+            {"id": "model-crop", "label": "PRIVATE MODEL DESCRIPTION"},
+            {"id": "jev-crop", "label": "PRIVATE JEV DESCRIPTION"}]
+        for binding, role in zip(context["bindings"], ("model-crop", "jev-crop")):
+            binding["role"] = role
+        context["observations"]["images"] = [
+            {"role": "model-crop", "asset": "opaque-model-image"},
+            {"role": "jev-crop", "asset": "opaque-jev-image"}]
+        return context
+
+    def test_crop_choice_compares_complete_object_coverage_not_routes(self):
+        context = self._crop_context()
+        original = copy.deepcopy(context)
+        questions = build_questions(context)
+        self.assertEqual(set(questions), {"selection", "anyFits"})
+        self.assertEqual(questions["selection"]["type"], "choice")
+        self.assertEqual(set(questions["selection"]["criteria"]), {"model-crop", "jev-crop"})
+        instructions = questions["selection"]["instructions"]
+        self.assertIn("complete intended object with minimal unrelated content", instructions)
+        self.assertIn("cuts off parts", instructions)
+        self.assertNotIn("Select the most suitable eligible route", instructions)
+        self.assertEqual(questions["anyFits"]["type"], "noul")
+        self.assertIn("either crop", questions["anyFits"]["instructions"])
+        self.assertIn("neither crop is sufficient", questions["anyFits"]["instructions"])
+        for index, role in enumerate(("model-crop", "jev-crop")):
+            criterion = questions["selection"]["criteria"][role]
+            self.assertEqual(criterion["candidateIndex"], index)
+            self.assertEqual(criterion["imageRole"], role)
+            self.assertEqual(criterion["imageIndex"], index)
+            self.assertIn("`observations.images[" + str(index) + "].asset`", criterion["description"])
+        self.assertNotIn("PRIVATE", repr(questions))
+        self.assertEqual(context, original)
+
+    def test_crop_choice_maps_by_role_not_candidate_or_image_order(self):
+        context = self._crop_context()
+        context["observations"]["images"].reverse()
+        questions = build_questions(context)
+        self.assertEqual(questions["selection"]["criteria"]["model-crop"]["imageIndex"], 1)
+        self.assertEqual(questions["selection"]["criteria"]["jev-crop"]["imageIndex"], 0)
+        context["candidates"].reverse()
+        questions = build_questions(context)
+        model = questions["selection"]["criteria"]["model-crop"]
+        self.assertEqual(model["candidateIndex"], 1)
+        self.assertEqual(model["imageRole"], "model-crop")
+        self.assertEqual(model["imageIndex"], 1)
+        self.assertIn("`observations.images[1].asset`", model["description"])
+
+    def test_crop_choice_missing_ambiguous_or_extra_images_fail_closed(self):
+        cases = [
+            [],
+            [{"role": "model-crop", "asset": "one"}],
+            [{"role": "model-crop", "asset": "one"}, {"role": "model-crop", "asset": "two"}],
+            [{"role": "model-crop", "asset": "one"}, {"role": "reference", "asset": "two"}],
+            [{"role": "model-crop", "asset": "one"}, {"role": "jev-crop", "asset": "one"}],
+            [{"role": "model-crop", "asset": "one"}, {"role": "jev-crop", "asset": "two"},
+             {"role": "reference", "asset": "three"}],
+        ]
+        for images in cases:
+            context = self._crop_context()
+            context["observations"]["images"] = images
+            with self.subTest(images=images), self.assertRaises(DecisionQuestionError):
+                build_questions(context)
+
+    def test_crop_choice_requires_exact_options_and_unambiguous_bound_evidence(self):
+        for candidates in ([{"id": "model-crop"}], [{"id": "model-crop"}, {"id": "other"}],
+                           [{"id": "model-crop"}, {"id": "jev-crop"}, {"id": "other"}]):
+            context = self._crop_context()
+            context["candidates"] = candidates
+            with self.subTest(candidates=candidates), self.assertRaises(DecisionQuestionError):
+                build_questions(context)
+        for change in (lambda c: c.update(bindings=[]),
+                       lambda c: c["bindings"].pop(),
+                       lambda c: c["bindings"].append(copy.deepcopy(c["bindings"][0]))):
+            context = self._crop_context()
+            change(context)
+            with self.subTest(change=change), self.assertRaises(DecisionQuestionError):
+                build_questions(context)
+        context = self._crop_context()
+        context["requirements"]["decomposition"] = {
+            "image": "opaque-model-image", "objects": [{"id": "cup", "label": "cup"}]}
+        with self.assertRaises(DecisionQuestionError):
+            build_questions(context)
+
+    def test_crop_uncertainty_none_fit_and_out_of_set_validation_remain_intact(self):
+        context = self._crop_context()
+        response = response_for(context)
+        response["answers"]["selection"].update(
+            choice="model-crop", probabilities={"model-crop": 0.5, "jev-crop": 0.5}, confidence=0.0)
+        response["answers"]["anyFits"]["noul"] = 0.1
+        self.assertEqual(validate_answers(context, response), response)
+        invalid = copy.deepcopy(response)
+        invalid["answers"]["selection"]["choice"] = "other-crop"
+        with self.assertRaises(DecisionQuestionError) as error:
+            validate_answers(context, invalid)
+        self.assertEqual(error.exception.reason_code, "out-of-set")
+
+    def test_crop_specialization_requires_both_routing_group_and_crop_choice_pass(self):
+        ordinary = self._crop_context()
+        ordinary["subject"]["passId"] = "routing"
+        self.assertIn("Select the most suitable eligible route",
+                      build_questions(ordinary)["selection"]["instructions"])
+        strategy = self._crop_context()
+        strategy.update(kind="img2.build-strategy-context", group="build-strategy",
+                        questionSetVersion=QUESTION_SET_VERSIONS["build-strategy"])
+        self.assertIn("eligible construction plan", build_questions(strategy)["selection"]["instructions"])
 
     def test_valid_uncertainty_and_none_fit_are_not_transport_failures(self):
         context = make_context("repair")
