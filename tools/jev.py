@@ -16,6 +16,10 @@ import stat
 import tempfile
 import time
 import uuid
+import base64
+import io
+import json
+from contextlib import contextmanager
 
 from img2_core import state as core_state
 from img2_core.paths import resolve_workspace
@@ -32,6 +36,13 @@ from jev_checkpoint import consult as consult_checkpoint
 from jev_auth import CredentialError, auth_status, login as login_credential, resolve_api_key
 from jev_consent import POLICY_VERSION as CONSENT_POLICY_VERSION, ConsentError, require_consent, set_consent
 from jev_projection import POLICY_VERSION as PROJECTION_POLICY_VERSION, project_state
+from jev_consent import (
+    DECISION_PURPOSES, DecisionConsentError,
+    decision_consent_status, decision_session, revoke_decision_consent, set_decision_consent,
+)
+from jev_decision_questions import DecisionQuestionError, build_questions, _context_digest
+from jev_decision_provider import evaluate_context
+from jev_decision_transport import DecisionTransportError
 
 PREFIX = ".img2/artifacts/jev/"
 REQUEST_PATH = PREFIX + "repair-state.json"
@@ -832,14 +843,192 @@ def run_report_outcomes(workspace, args):
     return {"kind": "img2.jev-command", "version": 1, "status": report["status"], "artifact": artifact, "corpusPath": args.input, "liveCalls": 0, "calibrationStatus": "uncalibrated"}
 
 
+@contextmanager
+def _decision_file(workspace, relative):
+    """Open each path component without following symlinks, including on races."""
+    if (type(relative) is not str or not relative or "\\" in relative
+            or any(ord(ch) < 32 for ch in relative)):
+        raise DecisionQuestionError("context-fault")
+    parts = relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise DecisionQuestionError("context-fault")
+    directory = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    descriptor = None
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise DecisionQuestionError("context-fault")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            yield stream
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory)
+
+
+def _decision_json(workspace, relative, maximum):
+    with _decision_file(workspace, relative) as stream:
+        if os.fstat(stream.fileno()).st_size > maximum:
+            raise DecisionQuestionError("context-fault")
+        raw = stream.read(maximum + 1)
+    if len(raw) > maximum:
+        raise DecisionQuestionError("context-fault")
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise DecisionQuestionError("context-fault")
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw, object_pairs_hook=pairs,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, UnicodeError, RecursionError):
+        raise DecisionQuestionError("context-fault") from None
+
+
+def _decision_bindings(workspace, context):
+    for binding in context["bindings"]:
+        if "path" not in binding:
+            raise DecisionQuestionError("context-fault")
+        with _decision_file(workspace, binding["path"]) as stream:
+            hasher, size = hashlib.sha256(), 0
+            while chunk := stream.read(65536):
+                size += len(chunk)
+                if size > 64 * 1024 * 1024:
+                    raise DecisionQuestionError("context-fault")
+                hasher.update(chunk)
+        if hasher.hexdigest() != binding["sha256"]:
+            raise DecisionQuestionError("stale-evidence")
+
+
+def _decision_assets(context, assets):
+    """Accept only the metadata-free PNG records produced by prepare_image."""
+    from jev_decision_images import map_box, DecisionImageError
+    expected = {image["asset"] for image in context["observations"].get("images", [])}
+    if type(assets) is not dict or set(assets) != expected:
+        raise DecisionQuestionError("invalid-assets")
+    if not expected:
+        return assets
+    try:
+        from PIL import Image
+    except ImportError:
+        raise DecisionQuestionError("image-dependency-unavailable") from None
+    total = 0
+    for image in assets.values():
+        if (type(image) is not dict
+                or set(image) != {"format", "data_base64", "sha256", "width", "height", "transform"}
+                or image["format"] != "png" or type(image["data_base64"]) is not str
+                or any(type(image[side]) is not int or not 280 <= image[side] <= 1568 for side in ("width", "height"))
+                or type(image["transform"]) is not dict
+                or set(image["transform"]) != {"sourceWidth", "sourceHeight", "crop", "scaleX", "scaleY", "padX", "padY"}):
+            raise DecisionQuestionError("invalid-assets")
+        try:
+            data = base64.b64decode(image["data_base64"], validate=True)
+            total += len(data)
+            if (not data or len(data) > 16 * 1024 * 1024 or total > 32 * 1024 * 1024
+                    or hashlib.sha256(data).hexdigest() != image["sha256"]):
+                raise ValueError
+            with Image.open(io.BytesIO(data)) as decoded:
+                if (decoded.format != "PNG" or decoded.size != (image["width"], image["height"])
+                        or decoded.mode != "RGB" or decoded.info or getattr(decoded, "n_frames", 1) != 1):
+                    raise ValueError
+                decoded.verify()
+            transform = image["transform"]
+            map_box([0, 0, 1, 1], transform)
+            left, top, right, bottom = transform["crop"]
+            if (max(280, round((right - left) * transform["scaleX"])) != image["width"]
+                    or max(280, round((bottom - top) * transform["scaleY"])) != image["height"]):
+                raise ValueError
+        except (ValueError, TypeError, KeyError, OSError, DecisionImageError, Image.DecompressionBombError):
+            raise DecisionQuestionError("invalid-assets") from None
+    return assets
+
+
+def run_decision(workspace, args):
+    context = _decision_json(workspace, args.input, 256 * 1024)
+    questions = build_questions(context)
+    if context["group"] != args.decision_group:
+        raise DecisionQuestionError("context-fault")
+    if not questions:
+        raise DecisionQuestionError("missing-evidence")
+    if type(args.timeout) not in (int, float) or not math.isfinite(args.timeout) or not 0 < args.timeout <= 30:
+        raise DecisionQuestionError("context-fault")
+    # Consent is checked before opening the asset manifest or any bound image.
+    with decision_session(workspace, context["subject"]["runId"]) as session:
+        grant_sha = decision_consent_status(workspace, context["subject"]["runId"])["sha256"]
+        status = auth_status()
+        if status["status"] != "present":
+            raise DecisionConsentError(status["reasonCode"])
+        try:
+            key = resolve_api_key()
+        except CredentialError:
+            status = auth_status()
+            raise DecisionConsentError(status["reasonCode"] if status["status"] != "present"
+                                       else "credential-storage-error") from None
+        assets = _decision_json(workspace, args.assets, 48 * 1024 * 1024) if args.assets else {}
+        assets = _decision_assets(context, assets)
+        _decision_bindings(workspace, context)
+        # Local paths remain bound for freshness/cache identity, but the shared
+        # controller validates the advisory against this exact detached context.
+        projected = json.loads(canonical(context))
+        projected["bindings"] = [{"role": item["role"], "sha256": item["sha256"]}
+                                 for item in context["bindings"]]
+        request_digest = digest(canonical({"contextDigest": _context_digest(context),
+                                          "providerContextDigest": _context_digest(projected),
+                                          "consentSha256": grant_sha,
+                                          "assets": {name: image["sha256"] for name, image in assets.items()}}))
+        artifact = PREFIX + "decisions/" + request_digest + ".json"
+        prior = session.previous(request_digest)
+        if prior is not None:
+            if prior["status"] != "completed":
+                raise DecisionConsentError("ambiguous-paid-attempt")
+            result = _decision_json(workspace, artifact, MAX_JSON_BYTES)
+            if digest(canonical(result)) != prior["resultSha256"]:
+                raise DecisionQuestionError("cache-fault")
+            session.recheck()
+            return {"status": "answered", "reasonCode": "answered", "artifact": artifact,
+                    "cached": True, "consentSha256": grant_sha, "advisory": result}
+        session.reserve(request_digest)
+        # The lock serializes revocation and every group; reserve is fsynced
+        # before I/O, and every failed/unknown send retains its full 64k charge.
+        session.recheck()
+        result = evaluate_context(projected, api_key=key, assets=assets, timeout=args.timeout)
+        session.account(request_digest, result["usage"])
+        session.recheck()
+        _decision_bindings(workspace, context)
+        write_artifact(workspace, artifact, result)
+        session.complete(request_digest, digest(canonical(result)))
+        return {"status": "answered", "reasonCode": "answered", "artifact": artifact,
+                "cached": False, "consentSha256": grant_sha, "advisory": result}
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Advisory Jev repair routing; no scene mutations or acceptance authority.")
+    parser = argparse.ArgumentParser(description="Bounded advisory Jev decisions; no scene mutations or acceptance authority.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("login", help="Store a TypeSafe API key in macOS Keychain")
     commands.add_parser("auth-status", help="Report local credential presence without exposing the key")
     consent_command = commands.add_parser("consent", help="Authorize or revoke workspace disclosure")
-    consent_command.add_argument("action", choices=("authorize", "revoke"))
+    consent_command.add_argument("action", choices=("authorize", "revoke", "authorize-decisions", "revoke-decisions", "decision-status"))
     consent_command.add_argument("--workspace", default=None)
+    consent_command.add_argument("--run-id")
+    consent_command.add_argument("--token-budget", type=int)
+    consent_command.add_argument("--accept-image-disclosure", action="store_true",
+                                 help="Explicitly authorize image/reference/render disclosure to TypeSafe")
+    consent_command.add_argument("--accept-paid-calls", action="store_true",
+                                 help="Explicitly authorize paid routing, build-strategy, quality-review and repair")
+    for group in DECISION_PURPOSES:
+        sub = commands.add_parser("decision-" + group, help="Consult the typed " + group + " provider edge")
+        sub.set_defaults(decision_group=group)
+        sub.add_argument("--workspace", default=None)
+        sub.add_argument("--input", required=True, help="Trusted controller's workspace-relative typed context JSON")
+        sub.add_argument("--assets", help="Workspace-relative JSON map of prepared image records (read only after v4 consent)")
+        sub.add_argument("--timeout", type=float, default=15.0)
     for name in ("prepare", "route", "consult", "record-outcome", "replay", "report-outcomes"):
         sub = commands.add_parser(name)
         sub.add_argument("--workspace", default=None)
@@ -867,10 +1056,29 @@ def main(argv=None):
             return {"present": 0, "missing": 3, "storage-error": 1}[result["status"]]
         workspace = resolve_workspace(args.workspace) if args.command != "consent" or args.workspace else resolve_workspace(None)
         if args.command == "consent":
-            result = set_consent(workspace, args.action == "authorize")
+            if args.action in {"decision-status", "revoke-decisions"} and (
+                    args.token_budget is not None or args.accept_image_disclosure or args.accept_paid_calls):
+                raise DecisionConsentError("context-fault")
+            if args.action == "authorize-decisions":
+                result = set_decision_consent(workspace, args.run_id, args.token_budget,
+                                              images=args.accept_image_disclosure, paid=args.accept_paid_calls)
+            elif args.action == "decision-status":
+                result = decision_consent_status(workspace, args.run_id)
+            elif args.action == "revoke-decisions":
+                result = revoke_decision_consent(workspace, args.run_id)
+            else:
+                if (args.run_id is not None or args.token_budget is not None
+                        or args.accept_image_disclosure or args.accept_paid_calls):
+                    raise DecisionConsentError("context-fault")
+                result = set_consent(workspace, args.action == "authorize")
+                if args.action == "revoke":
+                    revoke_decision_consent(workspace)
             emit({"kind": "img2.jev-command", "version": 1, "status": "consent-updated", **result})
             return 0
         require(not (workspace / "plugin.json").exists(), "workspace must not be a plugin checkout")
+        if args.command.startswith("decision-"):
+            emit({"kind": "img2.jev-command", "version": 1, **run_decision(workspace, args)})
+            return 0
         if args.command in {"route", "consult"}:
             number(args.timeout, "timeout")
             require(0 < args.timeout <= 30, "timeout must be in (0, 30] seconds")
@@ -882,6 +1090,20 @@ def main(argv=None):
         emit(handler(workspace, args))
         return 0
     except (ContractError, CredentialError, ConsentError, ProviderError, OSError, RuntimeError, TypeError, ValueError, OverflowError) as err:
+        if args.command.startswith("decision-") or (args.command == "consent" and args.action.endswith("decisions")) or (
+                args.command == "consent" and args.action == "decision-status"):
+            if isinstance(err, (DecisionQuestionError, DecisionConsentError, DecisionTransportError)):
+                reason_code = err.reason_code
+            else:
+                reason_code = "context-fault"
+            reason_code = {"provider-timeout": "timeout", "invalid-response": "malformed",
+                           "invalid-answer": "malformed", "invalid-answer-keys": "malformed",
+                           "invalid-usage": "malformed", "model-mismatch": "malformed"}.get(reason_code, reason_code)
+            result = {"kind": "img2.jev-command", "version": 1, "status": "request-input", "reasonCode": reason_code}
+            if reason_code in {"credential-missing", "credential-rejected", "credential-storage-error"}:
+                result["requestedCommand"] = "img2-jev login"
+            emit(result)
+            return 2
         # Never print request bodies, provider exceptions, credentials or tracebacks.
         reason = str(err) if isinstance(err, (ContractError, CredentialError, ConsentError)) else "local artifact or workspace operation failed"
         emit({"kind": "img2.jev-command", "version": 1, "status": "error", "reason": reason})

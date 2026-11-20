@@ -1,12 +1,16 @@
 ---
 name: img2-jev
-description: Routes ambiguous img2 repair decisions from structured evaluation evidence through Jev TypeSafe. Use after an admitted render review to compare shadow advice or request an assisted repair proposal.
+description: Consults Jev for bounded routing, build strategy, quality review and repair advisories, plus legacy Environment advice. Never grants acceptance or mutation authority.
 ---
 
-# Jev repair router
+# Jev advisory decisions
 
 `$SKILL_DIR` is the absolute directory containing this SKILL.md. Run commands from the user's
-workspace. Python 3.10+ and img2 harness 0.2.5+ are required; no pip packages.
+workspace. Python 3.10+ and img2 harness 0.2.5+ are required. Legacy commands use the standard library;
+image-aware decisions additionally require the existing optional `requirements-decisions.txt` dependencies.
+
+For the four typed image-aware provider commands, explicit v4 enrollment and one durable per-run budget,
+follow [DECISIONS.md](DECISIONS.md). Existing `route` and `consult` below remain Environment-only v3 APIs.
 
 ## Install and discover
 
@@ -27,7 +31,7 @@ Do not use a domain profile to replace the current asset domain. Do not import b
 
 - Run the existing img2threejs state gate first. Respect pass ordering, hard gates and correction ceilings.
 - Run deterministic validation before any vision review; never invoke vision where the base forbids it.
-- Jev receives structured text, never images. Vision observes; validators measure; Jev recommends.
+- Legacy Environment commands receive structured text, never images. V4 decisions disclose prepared images only with separate consent. Validators measure; Jev recommends.
 - Default `shadow`: record advice, then follow the unchanged baseline workflow.
 - A router or integrity-gate error in shadow mode discards the advice, not the baseline workflow.
 - Explicit `assist`: show the proposal and require approval before any repair. No action executes here.
@@ -101,9 +105,9 @@ Authorize disclosure separately for each canonical workspace before any repair r
 python3 "$SKILL_DIR/tools/jev.py" consent authorize --workspace "$PWD"
 ```
 
-Consent is stored in the per-user `IMG2_HOME/config/jev-consent.json` file, outside shareable workspace artifacts. The `jev-disclosure-v3` grant is bound to the current user and canonical workspace identity; copying or moving a workspace does not transfer consent. Re-authorize after this disclosure-policy version change; v1 and v2 grants do not authorize current routing; authorize again after the disclosure-purpose change.
+Consent is stored in the per-user `IMG2_HOME/config/jev-consent.json` file, outside shareable workspace artifacts. The `jev-disclosure-v3` grant is bound to the current user and canonical workspace identity; copying or moving a workspace does not transfer consent. V1/v2 grants require reauthorization for the legacy Environment APIs. V3 never authorizes the separate v4 image-aware, four-purpose decisions in [DECISIONS.md](DECISIONS.md); v4 does not replace the legacy v3 grant.
 
-Revoke authorization for this workspace with `python3 "$SKILL_DIR/tools/jev.py" consent revoke --workspace "$PWD"`. Revocation blocks dispatch and invalidates current advice before it can be consumed.
+Revoke authorization for this workspace with `python3 "$SKILL_DIR/tools/jev.py" consent revoke --workspace "$PWD"`. This revokes legacy consent and any v4 run grants, blocks later dispatch and invalidates current advice before consumption. V4-only revocation is documented in DECISIONS.md.
 
 ## Route
 

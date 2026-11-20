@@ -19,5 +19,33 @@
     "actor": "agent",
     "command": "Read the img2.repair-recommendation artifact under the workspace .img2/artifacts/jev directory. A shadow recommendation never changes the baseline; assist proposals require approval. Recheck the current pipeline gates and correction limits before recording its canonical action. Never treat the Jev artifact-integrity gate as visual, geometry or final acceptance.",
     "after": ["jev-recommend"]
+  },
+  {
+    "id": "jev-decision-routing",
+    "title": "Consult the bounded routing decision edge",
+    "actor": "program",
+    "command": "python3 {plugin_dir}/tools/jev.py decision-routing --workspace {workspace} --input .img2/artifacts/jev/contexts/routing.json --assets .img2/artifacts/jev/contexts/routing-assets.json",
+    "after": []
+  },
+  {
+    "id": "jev-decision-build-strategy",
+    "title": "Consult the bounded build-strategy decision edge",
+    "actor": "program",
+    "command": "python3 {plugin_dir}/tools/jev.py decision-build-strategy --workspace {workspace} --input .img2/artifacts/jev/contexts/build-strategy.json --assets .img2/artifacts/jev/contexts/build-strategy-assets.json",
+    "after": []
+  },
+  {
+    "id": "jev-decision-quality-review",
+    "title": "Consult the bounded quality-review decision edge",
+    "actor": "program",
+    "command": "python3 {plugin_dir}/tools/jev.py decision-quality-review --workspace {workspace} --input .img2/artifacts/jev/contexts/quality-review.json --assets .img2/artifacts/jev/contexts/quality-review-assets.json",
+    "after": []
+  },
+  {
+    "id": "jev-decision-repair",
+    "title": "Consult the bounded repair decision edge",
+    "actor": "program",
+    "command": "python3 {plugin_dir}/tools/jev.py decision-repair --workspace {workspace} --input .img2/artifacts/jev/contexts/repair.json --assets .img2/artifacts/jev/contexts/repair-assets.json",
+    "after": []
   }
 ]

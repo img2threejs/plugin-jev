@@ -5,6 +5,9 @@ before invoking this module. ``assets`` is an explicitly prepared map keyed by
 ``observations.images[*].asset``; values may be image-module preparation records
 or TypeSafe image assets. No paths are resolved, files opened, auth discovered,
 or images prepared here. Only post_systemone performs network I/O.
+Caller asset keys are rebound to deterministic context/key-derived wire references,
+each checked to occur exactly once in its intended state image placeholder.
+TypeSafe's substring substitution must never insert images into ordinary text.
 
 Projection is an allowlist, not prose redaction: unknown fields and free text
 are omitted, including filenames, paths, credentials and executable proposals.
@@ -19,7 +22,7 @@ import hashlib
 import json
 
 from jev_decision_questions import (
-    DecisionQuestionError, _canonical, _context_digest, _identifier, _require,
+    DecisionQuestionError, _canonical, _context_digest, _identifier, _number, _require,
     _missing_evidence, _review_items, build_questions, validate_answers,
 )
 from jev_decision_transport import post_systemone
@@ -30,7 +33,7 @@ _ID_FIELDS = {
     "id", "label", "componentId", "featureId", "parentId", "candidateId",
     "routeId", "planId", "hypothesisId", "passId", "instanceOf", "asset",
 }
-_ID_LIST_FIELDS = {"componentIds", "featureIds", "dependencies", "prerequisites"}
+_ID_LIST_FIELDS = {"componentIds", "components", "featureIds", "dependencies", "prerequisites"}
 _ENUM_FIELDS = {
     "operation", "operations", "representation", "topology", "projection",
     "geometry", "camera", "material", "materialFamily", "detailPriority",
@@ -46,7 +49,7 @@ _STRUCTURED_FIELDS = {
     "expected", "observed", "bounds", "dimensions", "position", "rotation",
     "scale", "pivot", "approxBox", "requiredViews", "availableViews", "views",
     "materialSource", "source", "provenance", "allowedFields", "allowedComponents",
-    "geometry", "camera", "material", "articulation", "detailPriorities",
+    "geometry", "camera", "material", "articulation", "detailPriorities", "fieldPaths",
 }
 _NUMERIC_FIELDS = {
     "width", "height", "depth", "radius", "length", "thickness", "roughness",
@@ -55,7 +58,7 @@ _NUMERIC_FIELDS = {
     "partCoveragePassed", "silhouetteIoU", "interiorDifference", "orbitConsistency",
     "cost", "timeMs", "elapsedMs", "tokenCost", "minImprovement", "maxRegression",
     "score", "threshold", "count", "coverage", "locked", "required", "applicable",
-    "min", "max", "expectedCost", "rigRequired", "placementRequired",
+    "min", "max", "expectedCost", "rigRequired", "placementRequired", "rigHandoff",
 }
 # This deliberately does not admit arbitrary natural-language strings. Candidate
 # descriptions live in controlled structure, not an instructions channel.
@@ -83,14 +86,118 @@ _TERMS = {
     "geometry.parameters", "material.roughness", "material.metalness",
     "camera.projection", "camera.fov", "transform.position", "transform.rotation",
     "transform.scale",
+    "match-camera", "tube", "cushion", "curtain", "import-model", "bind-pbr",
+    "refresh-material", "calibrate", "bake", "probe", "configure-views", "configure-variants",
 }
 _OMIT = object()
+_FIELD_PATHS = {
+    "authoring.cameraEstimate", "authoring.inspectionViews", "authoring.sceneBuilder",
+    "authoring.resourceManifest", "authoring.probePosition", "runtime.glassTransmission",
+    "runtime.variants", "runtime.finishTarget",
+    "geometry.parameters", "material.roughness", "material.metalness",
+    "camera.projection", "camera.fov", "transform.position", "transform.rotation", "transform.scale",
+}
+
+# Fixed descriptions supplement opaque route options only. They are not route
+# admission, provider readiness, a quality claim, or caller-supplied card prose.
+_ROUTE_DESCRIPTIONS = {
+    "base-generic": (
+        "Base procedural Three.js workflow for a generic 3D object; not an explicit 2D route. "
+        "Geometry and review gates remain required."
+    ),
+    "interior": (
+        "Blender room-scene workflow for one enclosed room and its owned contents, excluding "
+        "separately routed components. Not for multi-room/open scenes or standalone objects."
+    ),
+    "character": (
+        "Rigged 3D character workflow requiring explicit rig intent and skeleton/skin evidence. "
+        "Not for static-only requests; blocking rig admission remains required."
+    ),
+    "cs2": (
+        "CS2 weapon/glove finish and identity spec augmentation consumed by a base 3D object child. "
+        "Independent authoritative classification may veto; selection establishes neither CS2 "
+        "identity nor texture rights."
+    ),
+    "pixi2d": (
+        "Editable PixiJS 2D scene workflow in an existing host, only for explicitly requested 2D. "
+        "Never a substitute for 3D or permission for a raster-only replacement."
+    ),
+}
+_ROUTING_FACT_ENUMS = {
+    "role": {"scene-container", "subject", "prop", "set-dressing"},
+    "enclosure": {"enclosed-room", "unknown"},
+    "stylization": {"unknown"},
+}
+
+
+def _routing_facts(value):
+    result = {}
+    for field, allowed in _ROUTING_FACT_ENUMS.items():
+        item = value.get(field)
+        if type(item) is str and item in allowed:
+            result[field] = item
+    count = value.get("roomCount")
+    if _number(count, 0, 2**53 - 1):
+        result["roomCount"] = count
+    box = value.get("box")
+    if (type(box) is list and len(box) == 4 and all(_number(edge) for edge in box)
+            and box[0] < box[2] and box[1] < box[3]):
+        result["box"] = list(box)
+    return result
+
+
+def _routing_request(value):
+    result = {}
+    output = value.get("expectedOutput")
+    if type(output) is str and output in {"2d", "3d"}:
+        result["expectedOutput"] = output
+    intent = value.get("intent")
+    if type(intent) is list:
+        result["intent"] = [item for item in intent if type(item) is str and item == "rig"]
+    route = value.get("explicitRoute")
+    if type(route) is str and route in _ROUTE_DESCRIPTIONS:
+        result["explicitRoute"] = route
+    return result
+
+
+def _routing_instances(value):
+    result = []
+    if type(value) is not list:
+        return result
+    for instance in value:
+        if type(instance) is not dict or not _identifier(instance.get("id")):
+            continue
+        facts = _routing_facts(instance)
+        if "role" not in facts or "box" not in facts:
+            continue
+        item = {"id": instance["id"], **facts}
+        if "instanceOf" in instance and (instance["instanceOf"] is None or _identifier(instance["instanceOf"])):
+            item["instanceOf"] = instance["instanceOf"]
+        observations = instance.get("observations")
+        if type(observations) is dict:
+            item["observations"] = _routing_facts(observations)
+        result.append(item)
+    return result
 
 
 def _project_data(value, field=None):
+    if field == "fieldPaths":
+        if type(value) is not list:
+            return _OMIT
+        return [item for item in value if type(item) is str and item in _FIELD_PATHS]
+    if field == "rigHandoff":
+        return value if type(value) is bool else _OMIT
     if type(value) is dict:
         result = {}
         for key, item in value.items():
+            if key == "materialSources":
+                # Expose only complete-list presence, never source hashes or prose.
+                result["materialSourcesPresent"] = (
+                    type(item) is list and bool(item) and all(
+                        type(source) is str and len(source) == 64
+                        and all(char in "0123456789abcdef" for char in source)
+                        for source in item))
+                continue
             if key not in _ID_FIELDS | _ID_LIST_FIELDS | _ENUM_FIELDS | _STRUCTURED_FIELDS | _NUMERIC_FIELDS:
                 continue
             projected = _project_data(item, key)
@@ -144,6 +251,14 @@ def _project_state(context):
         }
     observations = _project_data(context["observations"])
     observations["images"] = [dict(image) for image in context["observations"].get("images", [])]
+    if context["group"] == "routing":
+        request = requirements.get("request")
+        if type(request) is dict:
+            projected_requirements["request"] = _routing_request(request)
+        observations.pop("role", None)
+        observations.update(_routing_facts(context["observations"]))
+        if "instances" in context["observations"]:
+            observations["instances"] = _routing_instances(context["observations"]["instances"])
     return {
         "kind": context["kind"], "version": context["version"],
         "group": context["group"], "subject": dict(context["subject"]),
@@ -184,6 +299,44 @@ def _prepare_assets(context, assets):
     return result
 
 
+def _wire_reference(context_digest, asset_key):
+    return "imgref-" + hashlib.sha256(_canonical([context_digest, asset_key])).hexdigest()
+
+
+def _string_values(value, path=()):
+    # TypeSafe substitutes string values, not object keys.
+    if type(value) is str:
+        yield path, value
+    elif type(value) is dict:
+        for key, item in value.items():
+            yield from _string_values(item, path + (key,))
+    elif type(value) is list:
+        for index, item in enumerate(value):
+            yield from _string_values(item, path + (index,))
+
+
+def _wire_assets(state, questions, prepared, context_digest):
+    if not prepared:
+        return {}
+    references = {key: _wire_reference(context_digest, key) for key in prepared}
+    _require(len(set(references.values())) == len(references), "asset-reference-collision")
+    expected = {}
+    for index, image in enumerate(state["observations"]["images"]):
+        reference = references[image["asset"]]
+        image["asset"] = reference
+        expected[reference] = ("state", "observations", "images", index, "asset")
+    # References match substrings throughout state/instructions/criteria. Each
+    # must occur once, as its whole intended placeholder value, and nowhere else.
+    counts = dict.fromkeys(expected, 0)
+    for path, text in _string_values({"state": state, "questions": questions}):
+        for reference, intended in expected.items():
+            if reference in text:
+                _require(path == intended and text == reference, "asset-reference-collision")
+                counts[reference] += 1
+    _require(all(count == 1 for count in counts.values()), "asset-reference-collision")
+    return {references[key]: image for key, image in prepared.items()}
+
+
 def evaluate_context(context, *, api_key, assets=None, timeout=15.0):
     """Consult the real transport using only explicitly prepared, consented data.
 
@@ -193,13 +346,19 @@ def evaluate_context(context, *, api_key, assets=None, timeout=15.0):
     """
     # Freeze input identity before constructing questions or calling untrusted I/O.
     snapshot = json.loads(_canonical(context))
+    context_digest = _context_digest(snapshot)
     questions = build_questions(snapshot)
     if not questions:
         details = [{"assessment": key, **_missing_evidence(snapshot, item)}
                    for key, item in _review_items(snapshot)]
         raise DecisionQuestionError("missing-evidence", details=details)
+    if snapshot["group"] == "routing":
+        for candidate in snapshot["candidates"]:
+            route_id = candidate.get("routeId")
+            if type(route_id) is str and route_id in _ROUTE_DESCRIPTIONS:
+                questions["selection"]["criteria"][candidate["id"]]["description"] = _ROUTE_DESCRIPTIONS[route_id]
     state = _project_state(snapshot)
-    prepared = _prepare_assets(snapshot, assets)
+    prepared = _wire_assets(state, questions, _prepare_assets(snapshot, assets), context_digest)
     payload = {"model": snapshot["requestedModel"], "state": state, "questions": questions}
     if prepared:
         payload["assets"] = prepared
@@ -211,6 +370,6 @@ def evaluate_context(context, *, api_key, assets=None, timeout=15.0):
     return {
         "kind": "img2.decision-advisory", "version": 1,
         "group": snapshot["group"], "subject": dict(snapshot["subject"]),
-        "contextDigest": _context_digest(snapshot), "model": validated["model"],
+        "contextDigest": context_digest, "model": validated["model"],
         "answers": validated["answers"], "usage": validated["usage"],
     }

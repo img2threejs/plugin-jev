@@ -87,18 +87,234 @@ class DecisionProviderTest(unittest.TestCase):
         self.assertEqual(state["candidates"][0]["specDeltas"], [{"field": "material.roughness", "value": 0.35}])
         self.assertEqual(context, original)
 
-    def test_prepared_assets_keep_keys_and_only_wire_image_properties(self):
+    def test_routing_descriptions_use_only_fixed_approved_route_semantics(self):
+        context = make_context()
+        routes = ["base-generic", "interior", "character", "cs2", "pixi2d"]
+        context["candidates"] = [
+            {"id": "option-" + str(index), "routeId": route, "outputKind": "3d-object",
+             "display": {"appliesTo": "PRIVATE DISPLAY MUST NOT LEAK"},
+             "description": "UNTRUSTED ROUTE INSTRUCTION", "label": "private-label.jpg"}
+            for index, route in enumerate(routes)]
+        original = copy.deepcopy(context)
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            result = provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        payload = post.call_args.args[0]
+        criteria = payload["questions"]["selection"]["criteria"]
+        self.assertEqual(set(criteria), {item["id"] for item in original["candidates"]})
+        descriptions = [criteria[item["id"]]["description"] for item in original["candidates"]]
+        self.assertEqual(len(set(descriptions)), 5)
+        for index, route in enumerate(routes):
+            self.assertEqual(criteria["option-" + str(index)]["candidateIndex"], index)
+            self.assertEqual(descriptions[index], provider._ROUTE_DESCRIPTIONS[route])
+        self.assertIn("procedural Three.js", descriptions[0])
+        self.assertIn("one enclosed room", descriptions[1])
+        self.assertIn("explicit rig intent", descriptions[2])
+        self.assertIn("classification may veto", descriptions[3])
+        self.assertIn("explicitly requested 2D", descriptions[4])
+        encoded = json.dumps(payload)
+        for text in ("PRIVATE DISPLAY", "UNTRUSTED ROUTE", "private-label.jpg"):
+            self.assertNotIn(text, encoded)
+        self.assertEqual([item["routeId"] for item in payload["state"]["candidates"]], routes)
+        self.assertEqual(context, original)
+        self.assertEqual(result["contextDigest"], digest(original))
+
+    def test_unknown_routes_and_other_decision_groups_keep_generic_criteria(self):
+        for group in ("routing", "build-strategy", "repair"):
+            context = make_context(group)
+            context["candidates"][0]["routeId"] = "base" if group == "routing" else "base-generic"
+            context["candidates"][1]["routeId"] = "not-an-approved-route"
+            with self.subTest(group=group), mock.patch.object(
+                    provider, "post_systemone", return_value=response_for(context)) as post:
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+            self.assertEqual(post.call_args.args[0]["questions"], build_questions(context))
+
+    def test_strategy_preserves_controlled_operations_and_both_component_id_shapes(self):
+        context = make_context("build-strategy")
+        context["candidates"][0].update(
+            components=["body", "handle", "/private/component", "arbitrary component prose"],
+            operations=["lathe", "sweep"],
+            description="PRIVATE STRATEGY DISPLAY")
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        candidate = post.call_args.args[0]["state"]["candidates"][0]
+        self.assertEqual(candidate["operations"], ["lathe", "sweep"])
+        self.assertEqual(candidate["components"], ["body", "handle"])
+        self.assertEqual(candidate["componentIds"], ["body", "handle"])
+        self.assertNotIn("description", candidate)
+        self.assertNotIn("private", json.dumps(candidate))
+
+    def test_native_strategy_allowlist_preserves_approved_scope_without_source_hashes(self):
+        context = make_context("build-strategy")
+        context["candidates"][0].update(
+            operations=["lathe", "match-camera", "bind-pbr", "graphics"],
+            fieldPaths=["geometry.parameters"], materialSources=["a" * 64], rigHandoff=True,
+            specFields=["geometry.parameters"], expectedMeasurements=["silhouetteIoU"])
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        candidate = post.call_args.args[0]["state"]["candidates"][0]
+        self.assertEqual(candidate["operations"], ["lathe", "match-camera", "bind-pbr"])
+        self.assertEqual(candidate["fieldPaths"], ["geometry.parameters"])
+        self.assertIs(candidate["rigHandoff"], True)
+        self.assertIs(candidate["materialSourcesPresent"], True)
+        for field in ("materialSources", "specFields", "expectedMeasurements"):
+            self.assertNotIn(field, candidate)
+
+    def test_native_strategy_candidates_keep_operation_field_and_rig_distinctions(self):
+        context = make_context("build-strategy")
+        source_hash = "1234567890abcdef" * 4
+        context["candidates"] = [
+            {"id": "camera-plan", "components": ["room"], "operations": ["match-camera"],
+             "fieldPaths": ["authoring.cameraEstimate", "authoring.inspectionViews"],
+             "rigHandoff": False, "materialSources": []},
+            {"id": "material-plan", "components": ["room"], "operations": ["bind-pbr"],
+             "fieldPaths": ["authoring.resourceManifest", "runtime.finishTarget"],
+             "rigHandoff": True, "materialSources": [source_hash]},
+        ]
+        original = copy.deepcopy(context)
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            result = provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        candidates = post.call_args.args[0]["state"]["candidates"]
+        self.assertEqual(candidates[0], {
+            "id": "camera-plan", "components": ["room"], "operations": ["match-camera"],
+            "fieldPaths": ["authoring.cameraEstimate", "authoring.inspectionViews"],
+            "rigHandoff": False, "materialSourcesPresent": False})
+        self.assertEqual(candidates[1], {
+            "id": "material-plan", "components": ["room"], "operations": ["bind-pbr"],
+            "fieldPaths": ["authoring.resourceManifest", "runtime.finishTarget"],
+            "rigHandoff": True, "materialSourcesPresent": True})
+        self.assertNotIn(source_hash, json.dumps(post.call_args.args[0]))
+        self.assertEqual(context, original)
+        self.assertEqual(result["contextDigest"], digest(original))
+
+    def test_all_approved_interior_operations_and_fields_survive_without_arbitrary_paths(self):
+        context = make_context("build-strategy")
+        operations = [
+            "match-camera", "box", "mesh", "tube", "lathe", "cushion", "curtain", "import-model",
+            "bind-pbr", "refresh-material", "calibrate", "bake", "probe", "configure-views", "configure-variants"]
+        fields = [
+            "authoring.cameraEstimate", "authoring.inspectionViews", "authoring.sceneBuilder",
+            "authoring.resourceManifest", "authoring.probePosition", "runtime.glassTransmission",
+            "runtime.variants", "runtime.finishTarget", "geometry.parameters", "material.roughness",
+            "material.metalness", "camera.projection", "camera.fov", "transform.position",
+            "transform.rotation", "transform.scale"]
+        context["candidates"][0].update(
+            operations=operations + ["PRIVATE OPERATION", "unsupported-operation"],
+            fieldPaths=fields + ["/private/secret", "authoring.sceneBuilder; PRIVATE COMMAND",
+                                 "authoring.sceneBuilder.secret", "rig", {"field": "authoring.sceneBuilder"}],
+            materialSources=[], materialSourcesPresent=True, rigHandoff=False)
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        candidate = post.call_args.args[0]["state"]["candidates"][0]
+        self.assertEqual(candidate["operations"], operations)
+        self.assertEqual(candidate["fieldPaths"], fields)
+        self.assertIs(candidate["materialSourcesPresent"], False)
+        self.assertIs(candidate["rigHandoff"], False)
+        self.assertNotIn("PRIVATE", json.dumps(post.call_args.args[0]))
+        self.assertNotIn("/private/", json.dumps(post.call_args.args[0]))
+
+    def test_material_presence_and_rig_handoff_are_derived_or_strict_booleans(self):
+        cases = [
+            ([], False, True), (["a" * 64], True, False),
+            (["a" * 64, "PRIVATE SOURCE"], False, 1),
+            ("a" * 64, False, "true"), (["G" * 64], False, None)]
+        for sources, expected, rig in cases:
+            context = make_context("build-strategy")
+            context["candidates"][0].update(
+                materialSources=sources, materialSourcesPresent=True, rigHandoff=rig,
+                fieldPaths={"field": "authoring.sceneBuilder"})
+            with self.subTest(sources=sources, rig=rig), mock.patch.object(
+                    provider, "post_systemone", return_value=response_for(context)) as post:
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+            candidate = post.call_args.args[0]["state"]["candidates"][0]
+            self.assertIs(candidate["materialSourcesPresent"], expected)
+            self.assertNotIn("materialSources", candidate)
+            self.assertNotIn("fieldPaths", candidate)
+            if type(rig) is bool:
+                self.assertIs(candidate["rigHandoff"], rig)
+            else:
+                self.assertNotIn("rigHandoff", candidate)
+
+    def test_routing_request_room_and_instance_facts_survive_without_free_text(self):
+        context = make_context()
+        context["requirements"]["request"] = {
+            "expectedOutput": "3d", "intent": ["rig", "PRIVATE INTENT", "delete-everything"],
+            "explicitRoute": "character", "notes": "PRIVATE REQUEST", "apiKey": "PRIVATE SECRET",
+            "command": "PRIVATE COMMAND"}
+        context["observations"].update(
+            role="scene-container", box=[0, 0, 1, 1], enclosure="enclosed-room", roomCount=1,
+            stylization="unknown", notes="PRIVATE OBSERVATION",
+            instances=[{
+                "id": "chair-2", "role": "prop", "box": [0.1, 0.2, 0.5, 0.8], "instanceOf": "chair-1",
+                "label": "PRIVATE LABEL", "source": "/private/source.png",
+                "observations": {"enclosure": "enclosed-room", "roomCount": 1, "stylization": "unknown",
+                                 "notes": "PRIVATE INSTANCE", "apiKey": "PRIVATE SECRET"},
+            }])
+        original = copy.deepcopy(context)
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            result = provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        state = post.call_args.args[0]["state"]
+        self.assertEqual(state["requirements"]["request"], {
+            "expectedOutput": "3d", "intent": ["rig"], "explicitRoute": "character"})
+        self.assertEqual(state["observations"]["role"], "scene-container")
+        self.assertEqual(state["observations"]["box"], [0, 0, 1, 1])
+        self.assertEqual(state["observations"]["enclosure"], "enclosed-room")
+        self.assertEqual(state["observations"]["roomCount"], 1)
+        self.assertEqual(state["observations"]["stylization"], "unknown")
+        self.assertEqual(state["observations"]["instances"], [{
+            "id": "chair-2", "role": "prop", "box": [0.1, 0.2, 0.5, 0.8], "instanceOf": "chair-1",
+            "observations": {"enclosure": "enclosed-room", "roomCount": 1, "stylization": "unknown"}}])
+        self.assertNotIn("PRIVATE", json.dumps(post.call_args.args[0]))
+        self.assertNotIn("/private/", json.dumps(post.call_args.args[0]))
+        self.assertEqual(context, original)
+        self.assertEqual(result["contextDigest"], digest(original))
+
+    def test_routing_unknown_values_do_not_expand_disclosure_vocabulary(self):
+        context = make_context()
+        context["requirements"]["request"] = {
+            "expectedOutput": "PRIVATE OUTPUT", "intent": ["PRIVATE INTENT"], "explicitRoute": "base"}
+        context["observations"].update(
+            role="PRIVATE ROLE", enclosure="PRIVATE ENCLOSURE", roomCount="PRIVATE COUNT",
+            stylization="photorealistic", box=[-0.1, 0, 1, 1],
+            instances=[{"id": "chair", "role": "PRIVATE ROLE", "box": [0, 0, 1, 1]},
+                       {"id": "lamp", "role": "prop", "box": [0, 0, 2, 1]}])
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        state = post.call_args.args[0]["state"]
+        self.assertEqual(state["requirements"]["request"], {"intent": []})
+        for field in ("role", "enclosure", "roomCount", "stylization", "box"):
+            self.assertNotIn(field, state["observations"])
+        self.assertEqual(state["observations"]["instances"], [])
+        self.assertNotIn("PRIVATE", json.dumps(post.call_args.args[0]))
+        self.assertNotIn("photorealistic", json.dumps(post.call_args.args[0]))
+
+    def test_explicit_2d_request_and_approved_route_are_not_lost(self):
+        context = make_context()
+        context["requirements"]["request"] = {"expectedOutput": "2d", "intent": [], "explicitRoute": "pixi2d"}
+        context["observations"].update(enclosure="unknown", roomCount=0, stylization="unknown")
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        state = post.call_args.args[0]["state"]
+        self.assertEqual(state["requirements"]["request"], {
+            "expectedOutput": "2d", "intent": [], "explicitRoute": "pixi2d"})
+        self.assertEqual(state["observations"]["enclosure"], "unknown")
+        self.assertEqual(state["observations"]["roomCount"], 0)
+
+    def test_prepared_assets_map_to_single_use_wire_references_and_only_wire_properties(self):
         context = make_context()
         prepared = assets_for(context, prepared=True)
         with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
             provider.evaluate_context(context, api_key=KEY, assets=prepared)
         payload = post.call_args.args[0]
-        self.assertEqual(set(payload["assets"]), set(prepared))
-        for key, image in payload["assets"].items():
+        references = {original["asset"]: wire["asset"] for original, wire in zip(
+            context["observations"]["images"], payload["state"]["observations"]["images"])}
+        self.assertEqual(set(payload["assets"]), set(references.values()))
+        for key, reference in references.items():
+            self.assertRegex(reference, r"^imgref-[0-9a-f]{64}$")
+            image = payload["assets"][reference]
             self.assertEqual(set(image), {"type", "format", "data_base64"})
             self.assertEqual(image["type"], "image")
             self.assertEqual(image["data_base64"], prepared[key]["data_base64"])
-            self.assertEqual(json.dumps(payload["state"]).count(key), 1)
+            self.assertEqual(json.dumps(payload["state"]).count(reference), 1)
         self.assertNotIn("data_base64", json.dumps(context))
 
     def test_image_free_request_never_loads_or_discloses_files(self):
@@ -136,10 +352,98 @@ class DecisionProviderTest(unittest.TestCase):
         with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
             result = provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
         payload = post.call_args.args[0]
-        self.assertEqual(json.dumps(payload["state"]).count("image-reference-opaque"), 1)
+        reference = payload["state"]["observations"]["images"][0]["asset"]
+        self.assertEqual(json.dumps(payload["state"]).count(reference), 1)
+        self.assertNotIn("image-reference-opaque", json.dumps(payload))
         self.assertEqual(payload["state"]["requirements"]["decomposition"]["imageIndex"], 0)
         self.assertIn("`observations.images[0].asset`", payload["questions"]["object:cup:box"]["instructions"]["question"])
         self.assertEqual(result["answers"]["object:cup:box"]["type"], "box")
+
+    def test_short_asset_ids_never_replace_roles_instructions_or_criteria(self):
+        context = make_context("quality-review")
+        for image in context["observations"]["images"]:
+            image["asset"] = image["role"]
+        original = copy.deepcopy(context)
+        assets = assets_for(context, prepared=True)
+        original_assets = copy.deepcopy(assets)
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            first = provider.evaluate_context(context, api_key=KEY, assets=assets)
+            first_payload = copy.deepcopy(post.call_args.args[0])
+            second = provider.evaluate_context(context, api_key=KEY, assets=dict(reversed(list(assets.items()))))
+            second_payload = post.call_args.args[0]
+        self.assertEqual(first_payload, second_payload)
+        self.assertEqual(first["contextDigest"], digest(original))
+        self.assertEqual(second["contextDigest"], digest(original))
+        self.assertEqual(context, original)
+        self.assertEqual(assets, original_assets)
+        self.assertEqual(first_payload["questions"], build_questions(original))
+        wire_images = first_payload["state"]["observations"]["images"]
+        self.assertEqual([image["role"] for image in wire_images], ["reference", "render"])
+        references = set(first_payload["assets"])
+        self.assertEqual(references, {image["asset"] for image in wire_images})
+        self.assertTrue(references.isdisjoint({"reference", "render"}))
+
+        def values(value):
+            if type(value) is str:
+                yield value
+            elif type(value) is dict:
+                for item in value.values():
+                    yield from values(item)
+            elif type(value) is list:
+                for item in value:
+                    yield from values(item)
+
+        def substitute(value):
+            if type(value) is str:
+                for reference in references:
+                    value = value.replace(reference, "[IMAGE]")
+                return value
+            if type(value) is dict:
+                return {key: substitute(item) for key, item in value.items()}
+            if type(value) is list:
+                return [substitute(item) for item in value]
+            return value
+
+        strings = list(values({"state": first_payload["state"], "questions": first_payload["questions"]}))
+        for reference in references:
+            self.assertRegex(reference, r"^imgref-[0-9a-f]{64}$")
+            self.assertEqual(sum(text.count(reference) for text in strings), 1)
+        expanded = substitute({"state": first_payload["state"], "questions": first_payload["questions"]})
+        self.assertEqual(expanded["questions"], build_questions(original))
+        self.assertEqual(expanded["state"]["observations"]["images"], [
+            {"role": "reference", "asset": "[IMAGE]"}, {"role": "render", "asset": "[IMAGE]"}])
+
+    def test_duplicate_wire_references_fail_before_transport(self):
+        context = make_context()
+        with mock.patch.object(provider, "_wire_reference", return_value="imgref-" + "a" * 64), \
+                mock.patch.object(provider, "post_systemone") as post:
+            with self.assertRaises(DecisionQuestionError) as error:
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        self.assertEqual(error.exception.reason_code, "asset-reference-collision")
+        post.assert_not_called()
+
+    def test_wire_reference_in_other_state_instructions_or_criteria_fails_closed(self):
+        reference = "imgref-" + "a" * 64
+        other = "imgref-" + "b" * 64
+        for location in ("state", "instructions", "criteria"):
+            context = make_context()
+            if location == "state":
+                context["subject"]["objectId"] = reference
+            questions = build_questions(context)
+            if location == "instructions":
+                questions["selection"]["instructions"] += " " + reference + " twice " + reference
+            elif location == "criteria":
+                questions["selection"]["criteria"]["lathed"]["description"] = "embedded-" + reference
+            original = copy.deepcopy(context)
+            with self.subTest(location=location), \
+                    mock.patch.object(provider, "_wire_reference", side_effect=[reference, other]), \
+                    mock.patch.object(provider, "build_questions", return_value=questions), \
+                    mock.patch.object(provider, "post_systemone") as post:
+                with self.assertRaises(DecisionQuestionError) as error:
+                    provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+            self.assertEqual(error.exception.reason_code, "asset-reference-collision")
+            self.assertEqual(context, original)
+            post.assert_not_called()
 
     def test_digest_is_exact_canonical_entire_incoming_context(self):
         context = make_context()

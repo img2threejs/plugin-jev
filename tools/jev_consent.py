@@ -7,8 +7,14 @@ import stat
 import tempfile
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
+import re
 
 POLICY_VERSION = "jev-disclosure-v3"
+DECISION_POLICY_VERSION = "jev-disclosure-v4"
+DECISION_PURPOSES = ("routing", "build-strategy", "quality-review", "repair")
+DECISION_DISCLOSURES = ("image", "reference", "render")
+DECISION_REQUEST_TOKENS = 64000
 
 
 class ConsentError(ValueError):
@@ -81,6 +87,11 @@ def _store(path, value):
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         os.chmod(path, 0o600)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         try:
             os.unlink(temporary)
@@ -146,3 +157,243 @@ def require_consent(workspace):
                 return {"user": user, "workspace": identity, "policyVersion": POLICY_VERSION, "generation": entry["generation"]}
             break
     raise ConsentError("Jev workspace consent is absent or revoked")
+
+
+class DecisionConsentError(ConsentError):
+    def __init__(self, reason_code):
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def _decision_id(value):
+    if type(value) is not str or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}", value) is None:
+        raise DecisionConsentError("context-fault")
+    return value
+
+
+def _decision_path(workspace):
+    # A separate store keeps v3 APIs, grants and historical advice unchanged.
+    return _config_path(workspace).with_name("jev-decision-consent.json")
+
+
+def _private_json(path, default, maximum):
+    if not path.exists():
+        if path.is_symlink():
+            raise DecisionConsentError("consent-storage-error")
+        return default
+    if path.is_symlink() or path.parent.is_symlink():
+        raise DecisionConsentError("consent-storage-error")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        info, parent = os.fstat(fd), path.parent.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or parent.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077
+                or stat.S_IMODE(parent.st_mode) & 0o077 or info.st_size > maximum):
+            raise DecisionConsentError("consent-storage-error")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(maximum + 1)
+        if len(raw) > maximum:
+            raise DecisionConsentError("consent-storage-error")
+        def pairs(items):
+            result = {}
+            for key, item in items:
+                if key in result:
+                    raise ValueError
+                result[key] = item
+            return result
+        return json.loads(raw, object_pairs_hook=pairs,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, UnicodeError, RecursionError):
+        raise DecisionConsentError("consent-storage-error") from None
+    finally:
+        os.close(fd)
+
+
+def _decision_entries(path):
+    value = _private_json(path, {"kind": "img2.jev-decision-consents", "version": 4, "entries": []}, 128 * 1024)
+    if (type(value) is not dict or set(value) != {"kind", "version", "entries"}
+            or value["kind"] != "img2.jev-decision-consents" or type(value["version"]) is not int
+            or value["version"] != 4 or type(value["entries"]) is not list or len(value["entries"]) > 128):
+        raise DecisionConsentError("consent-storage-error")
+    seen = set()
+    fields = {"user", "workspace", "runId", "policyVersion", "generation", "enabled",
+              "purposes", "disclosures", "tokenBudget"}
+    for entry in value["entries"]:
+        if type(entry) is not dict or set(entry) != fields:
+            raise DecisionConsentError("consent-storage-error")
+        for field, size in (("user", 64), ("workspace", 64), ("generation", 32)):
+            if type(entry[field]) is not str or re.fullmatch("[0-9a-f]{" + str(size) + "}", entry[field]) is None:
+                raise DecisionConsentError("consent-storage-error")
+        _decision_id(entry["runId"])
+        if (entry["policyVersion"] != DECISION_POLICY_VERSION or type(entry["enabled"]) is not bool
+                or entry["purposes"] != list(DECISION_PURPOSES)
+                or entry["disclosures"] != list(DECISION_DISCLOSURES)
+                or type(entry["tokenBudget"]) is not int or not 0 < entry["tokenBudget"] <= 2**53 - 1):
+            raise DecisionConsentError("consent-storage-error")
+        key = (entry["user"], entry["workspace"], entry["runId"])
+        if key in seen:
+            raise DecisionConsentError("consent-storage-error")
+        seen.add(key)
+    return value
+
+
+def _decision_entry(workspace, run_id):
+    _decision_id(run_id)
+    user, identity = _user_binding(), workspace_binding(workspace)
+    for entry in _decision_entries(_decision_path(workspace))["entries"]:
+        if (entry["user"], entry["workspace"], entry["runId"]) == (user, identity, run_id):
+            if entry["enabled"]:
+                return entry
+            raise DecisionConsentError("consent-declined")
+    raise DecisionConsentError("consent-required")
+
+
+def _consent_digest(entry):
+    return hashlib.sha256(json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def set_decision_consent(workspace, run_id, token_budget, *, images=False, paid=False):
+    """Only an explicit user authorization command may call this enrollment API."""
+    _decision_id(run_id)
+    if images is not True or paid is not True:
+        raise DecisionConsentError("consent-required")
+    if type(token_budget) is not int or not 0 < token_budget <= 2**53 - 1:
+        raise DecisionConsentError("invalid-budget")
+    path = _decision_path(workspace)
+    fd = _lock_consent(path)
+    try:
+        value = _decision_entries(path)
+        user, identity = _user_binding(), workspace_binding(workspace)
+        old = next((item for item in value["entries"] if
+                    (item["user"], item["workspace"], item["runId"]) == (user, identity, run_id)), None)
+        if old is not None and token_budget < old["tokenBudget"]:
+            raise DecisionConsentError("invalid-budget")
+        # Reauthorization/extension never deletes the run's spent reservations.
+        entry = {"user": user, "workspace": identity, "runId": run_id,
+                 "policyVersion": DECISION_POLICY_VERSION, "generation": uuid.uuid4().hex,
+                 "enabled": True, "purposes": list(DECISION_PURPOSES),
+                 "disclosures": list(DECISION_DISCLOSURES), "tokenBudget": token_budget}
+        value["entries"] = [item for item in value["entries"] if item is not old]
+        if len(value["entries"]) >= 128:
+            raise DecisionConsentError("consent-storage-error")
+        value["entries"].append(entry)
+        _store(path, value)
+    finally:
+        _unlock_consent(fd)
+    return decision_consent_status(workspace, run_id)
+
+
+def revoke_decision_consent(workspace, run_id=None):
+    if run_id is not None:
+        _decision_id(run_id)
+    path = _decision_path(workspace)
+    fd = _lock_consent(path)
+    try:
+        value = _decision_entries(path)
+        user, identity = _user_binding(), workspace_binding(workspace)
+        for entry in value["entries"]:
+            if (entry["user"] == user and entry["workspace"] == identity
+                    and (run_id is None or entry["runId"] == run_id)):
+                entry.update(enabled=False, generation=uuid.uuid4().hex)
+        _store(path, value)
+    finally:
+        _unlock_consent(fd)
+    return {"granted": False, "policyVersion": DECISION_POLICY_VERSION}
+
+
+def decision_consent_status(workspace, run_id):
+    """Controller-shaped live probe; v3 grants are never read or upgraded."""
+    entry = _decision_entry(workspace, run_id)
+    return {"granted": True, "purposes": list(entry["purposes"]),
+            "sha256": _consent_digest(entry), "tokenBudget": entry["tokenBudget"]}
+
+
+def _decision_ledger_path(workspace, run_id):
+    identity = hashlib.sha256((_user_binding() + workspace_binding(workspace) + run_id).encode()).hexdigest()
+    return _decision_path(workspace).with_name("jev-decision-run-" + identity + ".json")
+
+
+def _decision_ledger(path):
+    ledger = _private_json(path, {"version": 1, "attempts": {}}, 256 * 1024)
+    if (type(ledger) is not dict or set(ledger) != {"version", "attempts"}
+            or type(ledger["version"]) is not int or ledger["version"] != 1
+            or type(ledger["attempts"]) is not dict or len(ledger["attempts"]) > 256):
+        raise DecisionConsentError("budget-storage-error")
+    for key, attempt in ledger["attempts"].items():
+        if (type(key) is not str or re.fullmatch("[0-9a-f]{64}", key) is None
+                or type(attempt) is not dict or set(attempt) != {"status", "chargedTokens", "resultSha256"}
+                or attempt["status"] not in ("in-flight", "charged", "completed", "over-budget")
+                or type(attempt["chargedTokens"]) is not int or not 0 <= attempt["chargedTokens"] <= 2**54 - 2
+                or (attempt["status"] == "in-flight" and attempt["chargedTokens"] != DECISION_REQUEST_TOKENS)
+                or (attempt["status"] in ("charged", "completed") and attempt["chargedTokens"] > DECISION_REQUEST_TOKENS)
+                or (attempt["status"] == "over-budget" and attempt["chargedTokens"] <= DECISION_REQUEST_TOKENS)
+                or (attempt["status"] != "completed" and attempt["resultSha256"] is not None)
+                or (attempt["status"] == "completed" and
+                    (type(attempt["resultSha256"]) is not str or re.fullmatch("[0-9a-f]{64}", attempt["resultSha256"]) is None))):
+            raise DecisionConsentError("budget-storage-error")
+    return ledger
+
+
+class _DecisionSession:
+    def __init__(self, workspace, run_id, entry):
+        self.workspace, self.run_id, self.entry = workspace, run_id, entry
+        self.path = _decision_ledger_path(workspace, run_id)
+        self.ledger = _decision_ledger(self.path)
+
+    def recheck(self):
+        if _decision_entry(self.workspace, self.run_id) != self.entry:
+            raise DecisionConsentError("consent-changed")
+
+    def previous(self, request_digest):
+        return self.ledger["attempts"].get(request_digest)
+
+    def reserve(self, request_digest):
+        self.recheck()
+        if type(request_digest) is not str or re.fullmatch("[0-9a-f]{64}", request_digest) is None:
+            raise DecisionConsentError("context-fault")
+        if request_digest in self.ledger["attempts"]:
+            raise DecisionConsentError("ambiguous-paid-attempt")
+        spent = sum(item["chargedTokens"] for item in self.ledger["attempts"].values())
+        if spent + DECISION_REQUEST_TOKENS > self.entry["tokenBudget"]:
+            raise DecisionConsentError("budget-exhausted")
+        if len(self.ledger["attempts"]) >= 256:
+            raise DecisionConsentError("budget-storage-error")
+        self.ledger["attempts"][request_digest] = {
+            "status": "in-flight", "chargedTokens": DECISION_REQUEST_TOKENS, "resultSha256": None}
+        _store(self.path, self.ledger)
+
+    def account(self, request_digest, usage):
+        self.recheck()
+        # Successful wire responses are accounted even if local freshness fails.
+        if (type(usage) is not dict or set(usage) != {"input_tokens", "output_tokens"}
+                or any(type(value) is not int or not 0 <= value <= 2**53 - 1 for value in usage.values())):
+            raise DecisionConsentError("invalid-usage")
+        total = usage["input_tokens"] + usage["output_tokens"]
+        self.ledger["attempts"][request_digest] = {
+            "status": "over-budget" if total > DECISION_REQUEST_TOKENS else "charged",
+            "chargedTokens": total, "resultSha256": None}
+        _store(self.path, self.ledger)
+        if total > DECISION_REQUEST_TOKENS:
+            raise DecisionConsentError("provider-token-bound-exceeded")
+
+    def complete(self, request_digest, result_sha256):
+        self.recheck()
+        attempt = self.ledger["attempts"][request_digest]
+        if attempt["status"] != "charged":
+            raise DecisionConsentError("budget-storage-error")
+        attempt.update(status="completed", resultSha256=result_sha256)
+        _store(self.path, self.ledger)
+
+
+@contextmanager
+def decision_session(workspace, run_id):
+    """Serialize all four edges with revocation and one durable per-run budget.
+
+    The grant lock spans asset reads and dispatch: revoke cannot complete while
+    an already-authorized dispatch is in progress. No later dispatch can race it.
+    """
+    fd = _lock_consent(_decision_path(workspace))
+    try:
+        yield _DecisionSession(workspace, run_id, _decision_entry(workspace, run_id))
+    finally:
+        _unlock_consent(fd)

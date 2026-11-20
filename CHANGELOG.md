@@ -12,9 +12,15 @@
   controlled disclosure, explicit unevaluated review evidence, EXIF-upright image preparation and
   reversible Box coordinates, bounded HTTPS requests and separate credential-rejected outcomes.
   Optional image support uses `requirements-decisions.txt`; the base core stays dependency-free.
-- The new modules are not automatically installed as capabilities or invoked by existing workflows.
-  Four-purpose consent, production pass wiring and live qualification remain separate integration
-  requirements; the legacy Environment-only repair/checkpoint contracts are unchanged.
+- Expose the four typed decision edges through `decision-routing`, `decision-build-strategy`,
+  `decision-quality-review` and `decision-repair`. Require separately acknowledged v4 disclosure/paid
+  consent for the exact workspace/run, with a durable shared token budget and conservative 64k
+  reservation before every send. Record actual validated usage; retain unknown reservations.
+- Keep v3 grants and Environment-only repair/checkpoint contracts separate. Never auto-widen older
+  consent. Recheck consent/evidence around dispatch; refuse unsafe paths, unprepared images, revoked
+  grants and ambiguous attempts. Completed exact-result replay makes no additional provider call.
+- Declare only those callable typed edges and contributed commands; no automatic production hooks,
+  live qualification or acceptance authority is implied.
 
 ### Changed
 
