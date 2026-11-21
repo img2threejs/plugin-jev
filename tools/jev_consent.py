@@ -183,7 +183,10 @@ def _private_json(path, default, maximum):
         return default
     if path.is_symlink() or path.parent.is_symlink():
         raise DecisionConsentError("consent-storage-error")
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        raise DecisionConsentError("consent-storage-error") from None
     try:
         info, parent = os.fstat(fd), path.parent.stat()
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
@@ -203,7 +206,7 @@ def _private_json(path, default, maximum):
             return result
         return json.loads(raw, object_pairs_hook=pairs,
                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
-    except (ValueError, UnicodeError, RecursionError):
+    except (OSError, ValueError, UnicodeError, RecursionError):
         raise DecisionConsentError("consent-storage-error") from None
     finally:
         os.close(fd)
@@ -237,12 +240,12 @@ def _decision_entries(path):
     return value
 
 
-def _decision_entry(workspace, run_id):
+def _decision_entry(workspace, run_id, *, include_declined=False):
     _decision_id(run_id)
     user, identity = _user_binding(), workspace_binding(workspace)
     for entry in _decision_entries(_decision_path(workspace))["entries"]:
         if (entry["user"], entry["workspace"], entry["runId"]) == (user, identity, run_id):
-            if entry["enabled"]:
+            if entry["enabled"] or include_declined:
                 return entry
             raise DecisionConsentError("consent-declined")
     raise DecisionConsentError("consent-required")
@@ -254,9 +257,18 @@ def _consent_digest(entry):
 
 def set_decision_consent(workspace, run_id, token_budget, *, images=False, paid=False):
     """Only an explicit user authorization command may call this enrollment API."""
-    _decision_id(run_id)
     if images is not True or paid is not True:
         raise DecisionConsentError("consent-required")
+    return _set_decision_consent(workspace, run_id, token_budget, enabled=True)
+
+
+def decline_decision_consent(workspace, run_id, token_budget):
+    """Record explicit Jev refusal, not image disclosure or paid-call approval."""
+    return _set_decision_consent(workspace, run_id, token_budget, enabled=False)
+
+
+def _set_decision_consent(workspace, run_id, token_budget, *, enabled):
+    _decision_id(run_id)
     if type(token_budget) is not int or not 0 < token_budget <= 2**53 - 1:
         raise DecisionConsentError("invalid-budget")
     path = _decision_path(workspace)
@@ -271,7 +283,7 @@ def set_decision_consent(workspace, run_id, token_budget, *, images=False, paid=
         # Reauthorization/extension never deletes the run's spent reservations.
         entry = {"user": user, "workspace": identity, "runId": run_id,
                  "policyVersion": DECISION_POLICY_VERSION, "generation": uuid.uuid4().hex,
-                 "enabled": True, "purposes": list(DECISION_PURPOSES),
+                 "enabled": enabled, "purposes": list(DECISION_PURPOSES),
                  "disclosures": list(DECISION_DISCLOSURES), "tokenBudget": token_budget}
         value["entries"] = [item for item in value["entries"] if item is not old]
         if len(value["entries"]) >= 128:
@@ -280,7 +292,7 @@ def set_decision_consent(workspace, run_id, token_budget, *, images=False, paid=
         _store(path, value)
     finally:
         _unlock_consent(fd)
-    return decision_consent_status(workspace, run_id)
+    return decision_consent_status(workspace, run_id, include_declined=True)
 
 
 def revoke_decision_consent(workspace, run_id=None):
@@ -301,10 +313,14 @@ def revoke_decision_consent(workspace, run_id=None):
     return {"granted": False, "policyVersion": DECISION_POLICY_VERSION}
 
 
-def decision_consent_status(workspace, run_id):
-    """Controller-shaped live probe; v3 grants are never read or upgraded."""
-    entry = _decision_entry(workspace, run_id)
-    return {"granted": True, "purposes": list(entry["purposes"]),
+def decision_consent_status(workspace, run_id, *, include_declined=False):
+    """Probe a live grant, optionally exposing an explicit refusal to the controller.
+
+    The default remains fail-closed for provider callers and revoked grants.
+    Disabled entries expose their private identity and ceiling, never purposes.
+    """
+    entry = _decision_entry(workspace, run_id, include_declined=include_declined)
+    return {"granted": entry["enabled"], "purposes": list(entry["purposes"]) if entry["enabled"] else [],
             "sha256": _consent_digest(entry), "tokenBudget": entry["tokenBudget"]}
 
 

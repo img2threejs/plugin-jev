@@ -51,7 +51,7 @@ _FEATURE_CRITERIA = {
     "fail": "Current evidence demonstrates the named critical requirement is not met.",
     "uncertain": "Current evidence does not resolve whether this requirement is met.",
 }
-_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
+_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}\Z")
 _SHA = re.compile(r"[0-9a-f]{64}\Z")
 _FORBIDDEN = {
     "code", "sourcecode", "script", "scripts", "command", "commands", "argv",
@@ -219,6 +219,30 @@ def _validate_context(context):
         if "threshold" in feature:
             _require(_number(feature["threshold"], 0, 4))
     _require(len({feature["id"] for feature in features}) == len(features))
+    placement = requirements.get("placement")
+    if placement is not None or subject["passId"] in {"placement-size", "placement-yaw"}:
+        _require(group == "build-strategy" and type(placement) is dict
+                 and set(placement) == {"question"} and placement.get("question") in {"size", "yaw"},
+                 "invalid-placement-context")
+        question = placement["question"]
+        _require(subject["passId"] == "placement-" + question
+                 and context["policyVersion"] == "placement-policy-v1"
+                 and "decomposition" not in requirements, "invalid-placement-context")
+        roles = [binding["role"] for binding in bindings]
+        _require(all(roles.count(role) == 1 for role in
+                     ("reference", "inventory", "artifact", "size-prior", "camera", "depth", "support")),
+                 "missing-placement-evidence")
+        values = set()
+        for candidate in candidates:
+            _require(set(candidate) == {"id", "value"}, "invalid-placement-candidate")
+            value = candidate["value"]
+            valid = (type(value) is int and 0 <= value <= 7) if question == "yaw" else (
+                type(value) is list and len(value) == 3
+                and all(_number(axis, 0, 1e12) and axis > 0 for axis in value))
+            _require(valid, "invalid-placement-candidate")
+            digest = _canonical(value)
+            _require(digest not in values, "duplicate-placement-value")
+            values.add(digest)
     if group == "quality-review":
         _dimensions(context)
     decomposition = requirements.get("decomposition")
@@ -345,6 +369,16 @@ def build_questions(context):
         "build-strategy": "Select the most suitable eligible construction plan for this subject, not code or commands.",
         "repair": "Select the most suitable scoped repair hypothesis/action for the current failure, not a successful repair verdict.",
     }[group]
+    placement = context["requirements"].get("placement")
+    if placement is not None:
+        purpose = (
+            "Select the supplied metric scale vector that best matches this object's reference, "
+            "camera, depth, support and frozen class size prior. Do not change geometry or invent a scale."
+            if placement["question"] == "size" else
+            "Select the supplied yaw bin matching this object's orientation in the reference camera. "
+            "Bins 0 through 7 represent rotation about +Y in 45-degree increments from +Z forward. "
+            "Do not change scale, placement, geometry or invent an orientation."
+        )
     questions = {
         "selection": {
             "type": "choice",

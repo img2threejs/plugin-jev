@@ -30,7 +30,7 @@ from jev_decision_transport import post_systemone
 # These are data-field names, never arbitrary user/provider map keys. Adding a
 # field or controlled term is a disclosure-policy change and requires tests.
 _ID_FIELDS = {
-    "id", "label", "componentId", "featureId", "parentId", "candidateId",
+    "id", "componentId", "featureId", "parentId", "candidateId",
     "routeId", "planId", "hypothesisId", "passId", "instanceOf", "asset",
 }
 _ID_LIST_FIELDS = {"componentIds", "components", "featureIds", "dependencies", "prerequisites"}

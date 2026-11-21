@@ -166,6 +166,106 @@ class EnrollmentTests(_WorkspaceFixture):
         with self.assertRaisesRegex(consent.DecisionConsentError, "consent-declined"):
             consent.decision_consent_status(self.workspace, "run-1")
 
+    def test_explicit_decline_has_private_stable_identity_without_v3_enrollment(self):
+        declined = consent.decline_decision_consent(self.workspace, "run-1", 64000)
+        path = consent._decision_path(self.workspace)
+        entry = json.loads(path.read_text())["entries"][0]
+        actual_digest = hashlib.sha256(json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(declined, {
+            "granted": False, "purposes": [], "sha256": actual_digest, "tokenBudget": 64000})
+        for _ in range(2):
+            self.assertEqual(consent.decision_consent_status(
+                self.workspace, "run-1", include_declined=True), declined)
+        self.assertFalse(entry["enabled"])
+        self.assertEqual(entry["runId"], "run-1")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(consent._config_path(self.workspace).exists())
+        self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
+        with self.assertRaisesRegex(consent.DecisionConsentError, "consent-declined"):
+            consent._decision_entry(self.workspace, "run-1")
+        with self.assertRaisesRegex(consent.DecisionConsentError, "consent-declined"):
+            consent.decision_consent_status(self.workspace, "run-1")
+        with self.assertRaisesRegex(consent.DecisionConsentError, "consent-declined"):
+            with consent.decision_session(self.workspace, "run-1"):
+                self.fail("disabled entry authorized a provider session")
+        with self.assertRaisesRegex(consent.DecisionConsentError, "consent-required"):
+            consent.decision_consent_status(self.workspace, "run-2", include_declined=True)
+        elsewhere = self.base / "elsewhere"
+        elsewhere.mkdir()
+        with self.assertRaisesRegex(consent.DecisionConsentError, "consent-required"):
+            consent.decision_consent_status(elsewhere, "run-1", include_declined=True)
+        with mock.patch.object(consent, "_user_binding", return_value="0" * 64):
+            with self.assertRaisesRegex(consent.DecisionConsentError, "consent-required"):
+                consent.decision_consent_status(self.workspace, "run-1", include_declined=True)
+        other_run = consent.decline_decision_consent(self.workspace, "run-2", 64000)
+        self.assertNotEqual(other_run["sha256"], declined["sha256"])
+        self.assertEqual(consent.decision_consent_status(
+            self.workspace, "run-1", include_declined=True), declined)
+
+    def test_decline_and_reauthorization_preserve_spend_and_rotate_generations(self):
+        consent.set_consent(self.workspace, True)
+        v3_path = consent._config_path(self.workspace)
+        v3_bytes = v3_path.read_bytes()
+        granted = self.grant(64000)
+        with consent.decision_session(self.workspace, "run-1") as session:
+            session.reserve("a" * 64)
+        ledger_path = consent._decision_ledger_path(self.workspace, "run-1")
+        original_ledger = ledger_path.read_bytes()
+        declined = consent.decline_decision_consent(self.workspace, "run-1", 64000)
+        renewed = self.grant(64000)
+        self.assertEqual(len({granted["sha256"], declined["sha256"], renewed["sha256"]}), 3)
+        self.assertEqual(ledger_path.read_bytes(), original_ledger)
+        self.assertEqual(v3_path.read_bytes(), v3_bytes)
+        with consent.decision_session(self.workspace, "run-1") as session:
+            with self.assertRaisesRegex(consent.DecisionConsentError, "ambiguous-paid-attempt"):
+                session.reserve("a" * 64)
+            with self.assertRaisesRegex(consent.DecisionConsentError, "budget-exhausted"):
+                session.reserve("b" * 64)
+        for update in (self.grant, lambda budget: consent.decline_decision_consent(
+                self.workspace, "run-1", budget)):
+            with self.assertRaisesRegex(consent.DecisionConsentError, "invalid-budget"):
+                update(63999)
+        self.assertEqual(consent.decision_consent_status(self.workspace, "run-1"), renewed)
+        self.assertEqual(ledger_path.read_bytes(), original_ledger)
+
+    def test_invalid_decline_budgets_never_enroll_or_mutate_a_grant(self):
+        for budget in (True, False, 0, -1, 1.5, "64000", None, 2**53):
+            with self.subTest(budget=budget), self.assertRaisesRegex(
+                    consent.DecisionConsentError, "invalid-budget"):
+                consent.decline_decision_consent(self.workspace, "run-1", budget)
+        self.assertFalse(consent._decision_path(self.workspace).exists())
+        granted = self.grant(64000)
+        for budget in (0, 2**53, 63999):
+            with self.subTest(budget=budget), self.assertRaisesRegex(
+                    consent.DecisionConsentError, "invalid-budget"):
+                consent.decline_decision_consent(self.workspace, "run-1", budget)
+        self.assertEqual(consent.decision_consent_status(self.workspace, "run-1"), granted)
+
+    def test_disabled_status_rejects_malformed_or_nonprivate_storage(self):
+        declined = consent.decline_decision_consent(self.workspace, "run-1", 64000)
+        path = consent._decision_path(self.workspace)
+        original = path.read_bytes()
+        for malformed in (b"{", b'{"kind":null,"kind":null}', b"null"):
+            path.write_bytes(malformed)
+            with self.subTest(malformed=malformed), self.assertRaisesRegex(
+                    consent.DecisionConsentError, "consent-storage-error"):
+                consent.decision_consent_status(self.workspace, "run-1", include_declined=True)
+        path.write_bytes(original)
+        for target, unsafe_mode, safe_mode in ((path, 0o644, 0o600), (path.parent, 0o755, 0o700)):
+            target.chmod(unsafe_mode)
+            try:
+                with self.subTest(target=target), self.assertRaisesRegex(
+                        consent.DecisionConsentError, "consent-storage-error"):
+                    consent.decision_consent_status(self.workspace, "run-1", include_declined=True)
+            finally:
+                target.chmod(safe_mode)
+        with mock.patch.object(consent.os, "open", side_effect=PermissionError("private path denied")):
+            with self.assertRaisesRegex(consent.DecisionConsentError, "consent-storage-error"):
+                consent.decision_consent_status(self.workspace, "run-1", include_declined=True)
+        self.assertEqual(consent.decision_consent_status(
+            self.workspace, "run-1", include_declined=True), declined)
+
     def test_declared_edges_have_matching_executable_steps(self):
         manifest = json.loads((PLUGIN / "plugin.json").read_text())
         steps = json.loads((PLUGIN / "steps.json").read_text())
@@ -233,6 +333,14 @@ class DecisionCliTests(_WorkspaceFixture):
         result = json.loads(output.getvalue())
         self.assertNotIn(KEY, output.getvalue())
         return code, result
+
+    def invoke_consent(self, action, extra=()):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = self.cli.main(["consent", action, "--workspace", str(self.workspace), *extra])
+        self.assertNotIn(KEY, output.getvalue())
+        return code, json.loads(output.getvalue())
+
 
     def test_v3_cli_never_reads_assets_or_resolves_credentials(self):
         consent.set_consent(self.workspace, True)
@@ -386,6 +494,104 @@ class DecisionCliTests(_WorkspaceFixture):
             self.assertEqual(self.invoke()[1]["reasonCode"], "invalid-assets")
         for path in ("../assets.json", "/tmp/assets.json", "private/../assets.json"):
             self.assertEqual(self.invoke(extra=("--assets", path))[0], 2)
+        self.post.assert_not_called()
+
+    def test_fresh_decline_cli_needs_no_credential_or_prior_enrollment(self):
+        self.auth_mock.return_value = {"status": "missing", "reasonCode": "credential-missing"}
+        code, result = self.invoke_consent(
+            "decline-decisions", ("--run-id", "run-1", "--token-budget", "64000"))
+        status = consent.decision_consent_status(self.workspace, "run-1", include_declined=True)
+        self.assertEqual((code, result), (0, {
+            "kind": "img2.jev-command", "version": 1, "status": "consent-updated", **status}))
+        self.assertFalse(result["granted"])
+        self.assertEqual(result["purposes"], [])
+        self.assertFalse(consent._config_path(self.workspace).exists())
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
+        self.post.assert_not_called()
+
+    def test_explicit_decline_refuses_all_provider_edges_before_assets_or_auth(self):
+        consent.decline_decision_consent(self.workspace, "run-1", 256000)
+        for group in consent.DECISION_PURPOSES:
+            self.write_inputs(group)
+            with self.subTest(group=group), \
+                    mock.patch.object(self.cli, "_decision_file", wraps=self.cli._decision_file) as files, \
+                    mock.patch.object(self.cli, "_decision_assets") as assets, \
+                    mock.patch.object(self.cli, "_decision_bindings") as bindings:
+                code, result = self.invoke(group)
+                self.assertEqual((code, result["reasonCode"]), (2, "consent-declined"))
+                self.assertEqual([call.args[1] for call in files.call_args_list], ["context.json"])
+                assets.assert_not_called()
+                bindings.assert_not_called()
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
+        self.post.assert_not_called()
+        self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
+
+    def test_decline_cli_requires_run_and_positive_budget_and_refuses_accept_flags(self):
+        invalid = (
+            (("--token-budget", "64000"), "context-fault"),
+            (("--run-id", "run-1"), "invalid-budget"),
+            (("--run-id", "run-1", "--token-budget", "0"), "invalid-budget"),
+            (("--run-id", "run-1", "--token-budget", "-1"), "invalid-budget"),
+            (("--run-id", "run-1", "--token-budget", str(2**53)), "invalid-budget"),
+        )
+        for flag in ("--accept-image-disclosure", "--accept-paid-calls"):
+            invalid += ((("--run-id", "run-1", "--token-budget", "64000", flag), "context-fault"),)
+        invalid += ((("--run-id", "run-1", "--token-budget", "64000",
+                      "--accept-image-disclosure", "--accept-paid-calls"), "context-fault"),)
+        for arguments, reason in invalid:
+            with self.subTest(arguments=arguments):
+                code, result = self.invoke_consent("decline-decisions", arguments)
+                self.assertEqual((code, result["reasonCode"]), (2, reason))
+                self.assertFalse(consent._decision_path(self.workspace).exists())
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
+        self.post.assert_not_called()
+
+    def test_decision_status_cli_distinguishes_missing_granted_and_disabled(self):
+        arguments = ("--run-id", "run-1")
+        code, result = self.invoke_consent("decision-status", arguments)
+        self.assertEqual((code, result["reasonCode"]), (2, "consent-required"))
+        declined = consent.decline_decision_consent(self.workspace, "run-1", 64000)
+        for _ in range(2):
+            code, result = self.invoke_consent("decision-status", arguments)
+            self.assertEqual((code, result), (0, {
+                "kind": "img2.jev-command", "version": 1, "status": "consent-updated", **declined}))
+        granted = self.grant(64000)
+        code, result = self.invoke_consent("decision-status", arguments)
+        self.assertEqual(code, 0)
+        self.assertTrue(result["granted"])
+        self.assertEqual(result["sha256"], granted["sha256"])
+        self.assertEqual(result["purposes"], list(consent.DECISION_PURPOSES))
+        self.assertEqual(self.invoke_consent("revoke-decisions", arguments)[0], 0)
+        code, revoked = self.invoke_consent("decision-status", arguments)
+        self.assertEqual(code, 0)
+        self.assertFalse(revoked["granted"])
+        self.assertEqual(revoked["purposes"], [])
+        self.assertEqual(revoked["tokenBudget"], 64000)
+        self.assertNotEqual(revoked["sha256"], granted["sha256"])
+        self.assertEqual(revoked["sha256"], consent.decision_consent_status(
+            self.workspace, "run-1", include_declined=True)["sha256"])
+        for extra in (("--token-budget", "64000"), ("--accept-image-disclosure",), ("--accept-paid-calls",)):
+            code, result = self.invoke_consent("decision-status", (*arguments, *extra))
+            self.assertEqual((code, result["reasonCode"]), (2, "context-fault"))
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
+        self.post.assert_not_called()
+
+    def test_decision_status_cli_refuses_corrupt_or_public_private_entry(self):
+        consent.decline_decision_consent(self.workspace, "run-1", 64000)
+        path = consent._decision_path(self.workspace)
+        path.chmod(0o644)
+        code, result = self.invoke_consent("decision-status", ("--run-id", "run-1"))
+        self.assertEqual((code, result["reasonCode"]), (2, "consent-storage-error"))
+        path.chmod(0o600)
+        path.write_bytes(b"{")
+        code, result = self.invoke_consent("decision-status", ("--run-id", "run-1"))
+        self.assertEqual((code, result["reasonCode"]), (2, "consent-storage-error"))
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
         self.post.assert_not_called()
 
     def test_authorize_cli_requires_both_acknowledgements_and_status_is_local(self):

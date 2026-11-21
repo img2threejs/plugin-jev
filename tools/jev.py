@@ -39,6 +39,7 @@ from jev_projection import POLICY_VERSION as PROJECTION_POLICY_VERSION, project_
 from jev_consent import (
     DECISION_PURPOSES, DecisionConsentError,
     decision_consent_status, decision_session, revoke_decision_consent, set_decision_consent,
+    decline_decision_consent,
 )
 from jev_decision_questions import DecisionQuestionError, build_questions, _context_digest
 from jev_decision_provider import evaluate_context
@@ -1014,7 +1015,7 @@ def main(argv=None):
     commands.add_parser("login", help="Store a TypeSafe API key in macOS Keychain")
     commands.add_parser("auth-status", help="Report local credential presence without exposing the key")
     consent_command = commands.add_parser("consent", help="Authorize or revoke workspace disclosure")
-    consent_command.add_argument("action", choices=("authorize", "revoke", "authorize-decisions", "revoke-decisions", "decision-status"))
+    consent_command.add_argument("action", choices=("authorize", "revoke", "authorize-decisions", "decline-decisions", "revoke-decisions", "decision-status"))
     consent_command.add_argument("--workspace", default=None)
     consent_command.add_argument("--run-id")
     consent_command.add_argument("--token-budget", type=int)
@@ -1062,8 +1063,12 @@ def main(argv=None):
             if args.action == "authorize-decisions":
                 result = set_decision_consent(workspace, args.run_id, args.token_budget,
                                               images=args.accept_image_disclosure, paid=args.accept_paid_calls)
+            elif args.action == "decline-decisions":
+                if args.accept_image_disclosure or args.accept_paid_calls:
+                    raise DecisionConsentError("context-fault")
+                result = decline_decision_consent(workspace, args.run_id, args.token_budget)
             elif args.action == "decision-status":
-                result = decision_consent_status(workspace, args.run_id)
+                result = decision_consent_status(workspace, args.run_id, include_declined=True)
             elif args.action == "revoke-decisions":
                 result = revoke_decision_consent(workspace, args.run_id)
             else:

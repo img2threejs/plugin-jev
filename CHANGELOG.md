@@ -21,6 +21,12 @@
   grants and ambiguous attempts. Completed exact-result replay makes no additional provider call.
 - Declare only those callable typed edges and contributed commands; no automatic production hooks,
   live qualification or acceptance authority is implied.
+- Add explicit `consent decline-decisions` enrollment with a run-bound budget but no Jev image,
+  paid-call or purpose authorization. Provider callers still require a live grant; the host must
+  independently approve any fallback.
+- Support bounded dot/colon opaque decision identifiers needed by critical-feature bindings and
+  typed placement choices. Omit free-form candidate labels from the outbound field allowlist;
+  route descriptions remain fixed approved semantics, never caller-authored filenames or instructions.
 
 ### Changed
 
