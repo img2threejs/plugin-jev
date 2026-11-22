@@ -30,6 +30,12 @@
 
 ### Changed
 
+- Advance routing to `route-questions-v3` with no earlier-version alias. Separate visual localization
+  from closed route selection: empty candidates, only missing-object and per-target Noul/Box evidence,
+  and complete validated current-round inventory disclosed as data. Omit unused localization
+  candidates from provider state; preserve typed absence and all existing controller gates.
+  Scope missing-object judgment to omitted independently reconstructable foreground subjects, not
+  background scenery or already-covered contained details. Other three decision-group versions remain unchanged.
 - Bump Jev to 0.3.0; old repair recommendation records are stale under the current plugin version. Repair-state-v2 question and policy semantics remain unchanged.
 
 

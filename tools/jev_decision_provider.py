@@ -247,7 +247,8 @@ def _project_state(context):
         projected_requirements["decomposition"] = {
             "imageIndex": next(index for index, image in enumerate(images)
                                if image["asset"] == decomposition["image"]),
-            "objects": [_project_data(obj) for obj in decomposition["objects"]],
+            "objects": [dict(obj) for obj in decomposition["objects"]],
+            "inventory": [dict(obj) for obj in decomposition["inventory"]],
         }
     observations = _project_data(context["observations"])
     observations["images"] = [dict(image) for image in context["observations"].get("images", [])]
@@ -259,17 +260,19 @@ def _project_state(context):
         observations.update(_routing_facts(context["observations"]))
         if "instances" in context["observations"]:
             observations["instances"] = _routing_instances(context["observations"]["instances"])
-    return {
+    state = {
         "kind": context["kind"], "version": context["version"],
         "group": context["group"], "subject": dict(context["subject"]),
         "bindings": [{"role": item["role"], "sha256": item["sha256"]}
                      for item in context["bindings"]],
-        "candidates": [_project_data(item) for item in context["candidates"]],
         "observations": observations, "requirements": projected_requirements,
         "policyVersion": context["policyVersion"],
         "questionSetVersion": context["questionSetVersion"],
         "requestedModel": context["requestedModel"],
     }
+    if decomposition is None:
+        state["candidates"] = [_project_data(item) for item in context["candidates"]]
+    return state
 
 
 def _prepare_assets(context, assets):

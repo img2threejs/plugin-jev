@@ -11,6 +11,9 @@ image-aware decisions additionally require the existing optional `requirements-d
 
 For the four typed image-aware provider commands, explicit v4 enrollment and one durable per-run budget,
 follow [DECISIONS.md](DECISIONS.md). Existing `route` and `consult` below remain Environment-only v3 APIs.
+Routing uses `route-questions-v3`: localization asks only missing-object and target visibility/Box
+questions against the full current-round inventory, with no route candidates. Genuine route/crop
+selection remains a closed Choice plus `anyFits`; other decision-group versions are unchanged.
 
 ## Install and discover
 

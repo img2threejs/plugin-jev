@@ -17,7 +17,7 @@ for directory in (TESTS, TOOLS):
 
 import jev_decision_provider as provider
 from jev_decision_questions import DecisionQuestionError, build_questions
-from test_decision_questions import make_context, response_for
+from test_decision_questions import localization_context, make_context, response_for
 
 KEY = "offline-credential-not-a-live-secret"
 
@@ -345,19 +345,97 @@ class DecisionProviderTest(unittest.TestCase):
                     provider.evaluate_context(context, api_key=KEY, assets=assets)
             post.assert_not_called()
 
-    def test_decomposition_uses_one_copy_of_image_and_fixed_field_references(self):
-        context = make_context()
-        context["requirements"]["decomposition"] = {
-            "image": "image-reference-opaque", "objects": [{"id": "cup", "label": "coffee-mug", "approxBox": [0, 0, 1, 1]}]}
-        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+    def test_localization_discloses_complete_inventory_as_data_without_route_candidates(self):
+        context = localization_context()
+        context["observations"].update(
+            expectedOwner="PRIVATE OWNER", expert="PRIVATE EXPERT",
+            groundTruthBox=[0, 0, 1, 1], filename="private-image.png")
+        context["requirements"]["expectedOwner"] = "PRIVATE OWNER"
+        original = copy.deepcopy(context)
+        response = {
+            "model": "jev-1.14.0",
+            "answers": {
+                "missingObjects": {"type": "noul", "noul": 0.0},
+                "object:cup:visible": {"type": "noul", "noul": 0.0},
+                "object:cup:box": {"type": "box",
+                                   "box": {"left": 0.1, "top": 0.2, "right": 0.4, "bottom": 0.9},
+                                   "confidence": None},
+            },
+            "usage": {"input_tokens": 123, "output_tokens": 45},
+        }
+        with mock.patch.object(provider, "post_systemone", return_value=response) as post:
             result = provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
         payload = post.call_args.args[0]
-        reference = payload["state"]["observations"]["images"][0]["asset"]
-        self.assertEqual(json.dumps(payload["state"]).count(reference), 1)
-        self.assertNotIn("image-reference-opaque", json.dumps(payload))
-        self.assertEqual(payload["state"]["requirements"]["decomposition"]["imageIndex"], 0)
-        self.assertIn("`observations.images[0].asset`", payload["questions"]["object:cup:box"]["instructions"]["question"])
-        self.assertEqual(result["answers"]["object:cup:box"]["type"], "box")
+        state = payload["state"]
+        self.assertNotIn("candidates", state)
+        self.assertEqual(state["questionSetVersion"], "route-questions-v3")
+        decomposition = state["requirements"]["decomposition"]
+        self.assertEqual(decomposition, {
+            "imageIndex": 0,
+            "objects": original["requirements"]["decomposition"]["objects"],
+            "inventory": original["requirements"]["decomposition"]["inventory"],
+        })
+        self.assertEqual({key: question["type"] for key, question in payload["questions"].items()}, {
+            "missingObjects": "noul", "object:cup:visible": "noul", "object:cup:box": "box",
+        })
+        reference = state["observations"]["images"][0]["asset"]
+        self.assertEqual(json.dumps(state).count(reference), 1)
+        encoded = json.dumps(payload)
+        for private in ("expectedOwner", "expert", "groundTruthBox", "PRIVATE", "private-image.png",
+                        "image-reference-opaque", "private/reference.png", "private/render.png"):
+            self.assertNotIn(private, encoded)
+        self.assertEqual(result["answers"], response["answers"])
+        self.assertEqual(result["contextDigest"], digest(original))
+        self.assertEqual(context, original)
+
+    def test_localization_inventory_includes_other_targets_and_scene_container_roles(self):
+        for role in ("subject", "prop", "set-dressing", "scene-container"):
+            context = localization_context()
+            context["requirements"]["decomposition"]["inventory"][1]["role"] = role
+            with self.subTest(role=role), mock.patch.object(
+                    provider, "post_systemone", return_value=response_for(context)) as post:
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+            inventory = post.call_args.args[0]["state"]["requirements"]["decomposition"]["inventory"]
+            self.assertEqual([item["id"] for item in inventory], ["cup", "plate"])
+            self.assertEqual(inventory[1]["role"], role)
+
+    def test_invalid_localization_inventory_is_rejected_before_disclosure(self):
+        context = localization_context()
+        context["requirements"]["decomposition"]["inventory"][1]["expert"] = "private-owner"
+        with mock.patch.object(provider, "post_systemone") as post:
+            with self.assertRaises(DecisionQuestionError):
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        post.assert_not_called()
+
+    def test_localization_rejects_private_or_nonsemantic_labels_before_transport(self):
+        for label in ("private-name.png", "Coffee-Mug", "coffee:mug", "coffee_mug",
+                      "9mug", "a" * 97):
+            for location in ("target", "inventory"):
+                context = localization_context()
+                decomposition = context["requirements"]["decomposition"]
+                if location == "target":
+                    decomposition["objects"][0]["label"] = label
+                    decomposition["inventory"][0]["label"] = label
+                else:
+                    decomposition["inventory"][1]["label"] = label
+                with self.subTest(label=label, location=location), \
+                        mock.patch.object(provider, "post_systemone") as post:
+                    with self.assertRaises(DecisionQuestionError):
+                        provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+                    post.assert_not_called()
+        for label in ("coffee-mug", "chair2", "a" * 96):
+            context = localization_context()
+            decomposition = context["requirements"]["decomposition"]
+            for item in (decomposition["objects"][0], decomposition["inventory"][0]):
+                item.update(id="Cup.v1:main", label=label)
+            with self.subTest(valid_label=label), mock.patch.object(
+                    provider, "post_systemone", return_value=response_for(context)) as post:
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+            post.assert_called_once()
+            disclosed = post.call_args.args[0]["state"]["requirements"]["decomposition"]
+            self.assertEqual(disclosed["objects"][0]["label"], label)
+            self.assertEqual(disclosed["inventory"][0]["label"], label)
+            self.assertEqual(disclosed["objects"][0]["id"], "Cup.v1:main")
 
     def test_short_asset_ids_never_replace_roles_instructions_or_criteria(self):
         context = make_context("quality-review")

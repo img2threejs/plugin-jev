@@ -38,8 +38,8 @@ not inherit grants. Per-run private ledgers survive command restarts and consent
 
 ## Prepare the trusted handoff
 
-Use the Wave 1 `jev_decision_questions` context contract unchanged: exact kind/version/group,
-subject `{runId,objectId,revision,passId}`, bindings, eligible candidates, observations, requirements,
+Use the current `jev_decision_questions` context contract: exact kind/version/group,
+subject `{runId,objectId,revision,passId}`, bindings, candidates, observations, requirements,
 policyVersion, questionSetVersion and requestedModel `jev-1.14.0`. Every binding must include a
 workspace-relative `path` and current `sha256`. The CLI verifies real bound bytes before and after
 consultation; the caller still owns evidence completeness, provenance, eligibility and stage admission.
@@ -68,7 +68,7 @@ No questions are dropped or silently retried to fit; an oversized request fails 
 
 | Command | Context kind → declared advisory edge | Question set |
 |---|---|---|
-| `decision-routing` | `img2.route-context` → `img2.route-advisory` | `route-questions-v2` |
+| `decision-routing` | `img2.route-context` → `img2.route-advisory` | `route-questions-v3` |
 | `decision-build-strategy` | `img2.build-strategy-context` → `img2.build-strategy-advisory` | `strategy-questions-v1` |
 | `decision-quality-review` | `img2.quality-review-context` → `img2.quality-review-advisory` | `quality-review-questions-v1` |
 | `decision-repair` | `img2.repair-context` → `img2.repair-advisory` | `repair-decision-questions-v1` |
@@ -86,7 +86,7 @@ creating its fresh context and asset map. The timeout is a total transport deadl
 Success JSON has `status=answered`, `reasonCode=answered`, `advisory`, `artifact`, `cached` and
 `consentSha256`. The Wave 1 envelope is `img2.decision-advisory` v1 with group, subject, contextDigest,
 served model, answers and usage. It is the payload of each declared typed edge, not a canonical verdict.
-Low probabilities, confidence or `none-fits` Noul remain unchanged for the controller to arbitrate.
+Low probabilities, confidence or positive `anyFits` Noul remain unchanged for the controller to arbitrate.
 The allowlisted provider projection drops local paths, filenames, arbitrary prose and executable data.
 The advisory digest covers the controller-safe context: bindings contain only `{role,sha256}`.
 The CLI keeps a detached original with binding paths for local pre/post freshness checks and cache
@@ -99,11 +99,35 @@ Routing Choice descriptions are fixed program text for `base-generic`, `interior
 and `pixi2d`, never copied from candidate display/labels. Unknown routes and other groups retain the
 generic option description; these descriptions do not establish provider readiness or acceptance.
 Routing `crop-choice` instead compares `model-crop`/`jev-crop` for complete intended-object coverage
-and minimal unrelated content; unique matching images/bindings and the separate sufficiency Noul are required. Routing requires `route-questions-v2`; v1 contexts and cached advice are not reusable.
+and minimal unrelated content; unique matching images/bindings and the separate sufficiency Noul are required.
+Routing requires `route-questions-v3`; earlier routing contexts and cached advice are not reusable.
 Routing request disclosure preserves only expectedOutput `2d`/`3d`, intent `rig`, and an explicitRoute
 equal to one of those approved route ids. It is not full intent fidelity. Room/instance disclosure
 allows controlled roles, normalized boxes, opaque ids, numeric roomCount, enclosure `enclosed-room`
 or `unknown`, and stylization only `unknown`; unrecognized values and arbitrary prose are omitted.
+
+Routing contexts with `requirements.decomposition` are visual localization, not route selection.
+They require `candidates=[]` and exactly this decomposition shape:
+`{image,objects:[{id,label,approxBox}],inventory:[{id,label,role,approxBox}]}`.
+The full current-round inventory includes every proposed object, not only the current targets.
+Round 2 retains first-round proposals unchanged and adds only new proposal IDs; its localization
+targets are the additions, while its inventory is the accumulated first-round-plus-additions list.
+IDs are unique within each list; labels are bounded opaque identifiers, roles are `scene-container`,
+`subject`, `prop` or `set-dressing`, and boxes are normalized `[left,top,right,bottom]` with positive
+area. Each target's id, label and approximate box must match an inventory entry. Targets retain
+the 12-item bound; inventory uses the existing bounded-JSON list limit of 256, not a 12-placement cap.
+Only `missingObjects:Noul` and each target's `object:<id>:visible:Noul` / `object:<id>:box:Box`
+are asked. No Selection or `anyFits` is generated or accepted. The provider sees the complete
+validated inventory and target labels/roles/boxes as data, with no unused `candidates` state.
+Owner/expert/ground-truth fields are not disclosed; they are invalid inside decomposition entries.
+Typed valid absence remains answered evidence, not provider unavailability or route acceptance:
+the controller alone drops invisible targets and applies unchanged Box/crop uncertainty rules.
+`missingObjects` concerns an omitted independently reconstructable foreground subject needed for
+the declared request, assessed against the full inventory. Background scenery, contained details
+and parts already covered by an inventoried subject or scene-container do not separately require
+routes. This is not a whole-scene completeness waiver or a required false answer. Genuine route,
+crop, placement, strategy and repair choices still require nonempty closed candidates and `anyFits`.
+
 Strategy projection preserves known/approved interior operation enums, opaque `components`/
 `componentIds`, exactly allowlisted native/base `fieldPaths`, and boolean `rigHandoff`.
 `materialSourcesPresent` reports only a nonempty list of valid SHA-256 values, not provenance
@@ -143,6 +167,7 @@ From the plugin repository, with `IMG2_HARNESS_DIR` set to the existing local ha
 python3 -m unittest discover -s tests -p 'test_decision_enrollment.py' -v
 python3 -m unittest discover -s tests -p 'test_consent.py' -v
 python3 -m unittest discover -s tests -p 'test_decision_provider.py' -v
+python3 -m unittest discover -s tests -p 'test_decision_questions.py' -v
 python3 -m unittest discover -s tests -p 'test_manifest.py' -v
 ```
 
