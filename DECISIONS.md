@@ -181,6 +181,26 @@ accounting authority. A new consumer must match its own nonce, current context/c
 identity, validate field types/ranges, and retain reservations for missing/malformed proof or ambiguity.
 An ambiguous duplicate reports the unresolved existing liability, not permission to erase it or add
 another billable retry. Completed cached replay reports not-sent/0 without erasing historical spend.
+
+For `cached=true`, `advisory.usage` describes the earlier completed request, while the bound
+`not-sent`/0 receipt describes only this fresh invocation. Do not debit that historical usage again,
+require it to equal the current zero charge, or use the fresh nonce to erase an older unresolved
+host liability. A host can settle only its matching current invocation; the plugin's existing
+durable request charge remains unchanged. These journals are not one atomic transaction.
+
+Before consuming cached advice, the host must already have a verified settlement for the same
+request, subject and live consent. Without it, retain conservative liability and request input;
+a successful CLI cache lookup is not proof that the host's earlier pending attempt was settled.
+With a matching settlement, reuse must not debit twice; release any new invocation reservation
+only after validating its matching `not-sent` receipt.
+
+The host independently derives requestDigest from canonical JSON containing `contextDigest` of
+the full local context, `providerContextDigest` of that context with binding paths removed,
+`consentSha256`, and `assets` mapping asset ids to prepared-image SHA256 values. The receipt's
+contextDigest is the detached provider-context digest, not the full host journal identity.
+Verify accounting envelopes even on nonzero exit before discarding their fields. The host's
+request token limit must match the attested CLI reservation of 64000 before dispatch.
+
 The source-pinned core bridge/controller must consume this contract and align both journals before
 release qualification; these additive fields alone do not change an old controller's accounting.
 

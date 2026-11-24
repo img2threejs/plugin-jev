@@ -698,6 +698,133 @@ class DecisionCliTests(_WorkspaceFixture):
         self.assertEqual(self.invoke()[1]["reasonCode"], "consent-declined")
         self.post.assert_called_once()
 
+    def test_cache_hit_preserves_historical_charge_and_binds_only_current_invocation(self):
+        self.grant(64000)
+        response = response_for(self.context)
+        historical_charge = sum(response["usage"].values())
+        self.assertGreater(historical_charge, 0)
+        self.post.side_effect = None
+        self.post.return_value = response
+        code, first = self.invoke(extra=("--attempt-id", "a" * 32))
+        self.assertEqual(code, 0)
+        self.assertFalse(first["cached"])
+        self.assertEqual((first["sendState"], first["chargedTokens"]), ("charged", historical_charge))
+        ledger_path = consent._decision_ledger_path(self.workspace, "run-1")
+        original_ledger = ledger_path.read_bytes()
+        detached = copy.deepcopy(self.context)
+        detached["bindings"] = [{"role": item["role"], "sha256": item["sha256"]}
+                                for item in detached["bindings"]]
+        def sha(value):
+            encoded = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False, allow_nan=False).encode("utf-8")
+            return hashlib.sha256(encoded).hexdigest()
+        expected_request = sha({
+            "contextDigest": sha(self.context), "providerContextDigest": sha(detached),
+            "consentSha256": first["consentSha256"],
+            "assets": {name: image["sha256"] for name, image in self.assets.items()}})
+        self.auth_mock.reset_mock()
+        self.key_mock.reset_mock()
+        code, cached = self.invoke(extra=("--attempt-id", "b" * 32))
+        self.assertEqual(code, 0)
+        self.assertTrue(cached["cached"])
+        self.assertEqual((cached["sendState"], cached["chargedTokens"]), ("not-sent", 0))
+        self.assertEqual(cached["advisory"]["usage"], response["usage"])
+        self.assertEqual(cached["advisory"], first["advisory"])
+        self.assertEqual(cached["attempt"], {
+            "contextDigest": sha(detached), "requestDigest": expected_request,
+            "consentSha256": first["consentSha256"],
+            "invocationDigest": hashlib.sha256(b"b" * 32).hexdigest()})
+        self.assertNotEqual(cached["attempt"]["invocationDigest"], first["attempt"]["invocationDigest"])
+        self.assertEqual(ledger_path.read_bytes(), original_ledger)
+        self.assertEqual(consent._decision_ledger(ledger_path)["attempts"][expected_request]["chargedTokens"],
+                         historical_charge)
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
+        self.post.assert_called_once()
+
+    def test_duplicate_pending_request_reports_prior_liability_to_new_invocation(self):
+        self.grant(64000)
+        self.post.side_effect = DecisionTransportError("provider-timeout")
+        first = self.invoke(extra=("--attempt-id", "a" * 32))[1]
+        self.assertEqual((first["sendState"], first["chargedTokens"]), ("possibly-sent", 64000))
+        path = consent._decision_ledger_path(self.workspace, "run-1")
+        original_ledger = path.read_bytes()
+        second = self.invoke(extra=("--attempt-id", "b" * 32))[1]
+        self.assertEqual(second["reasonCode"], "ambiguous-paid-attempt")
+        self.assertEqual((second["sendState"], second["chargedTokens"]), ("possibly-sent", 64000))
+        self.assertEqual(second["attempt"]["requestDigest"], first["attempt"]["requestDigest"])
+        self.assertEqual(second["attempt"]["invocationDigest"], hashlib.sha256(b"b" * 32).hexdigest())
+        self.assertNotEqual(second["attempt"]["invocationDigest"], first["attempt"]["invocationDigest"])
+        self.assertEqual(path.read_bytes(), original_ledger)
+        self.post.assert_called_once()
+
+    def test_completed_cache_is_not_shared_across_subject_or_live_consent(self):
+        self.grant(256000)
+        response = response_for(self.context)
+        charge = sum(response["usage"].values())
+        self.post.side_effect = None
+        self.post.return_value = response
+        first = self.invoke(extra=("--attempt-id", "a" * 32))[1]
+        self.assertFalse(first["cached"])
+        self.context["subject"]["objectId"] = "different-owned-object"
+        self.write_inputs()
+        second = self.invoke(extra=("--attempt-id", "b" * 32))[1]
+        self.assertFalse(second["cached"])
+        self.assertNotEqual(first["advisory"]["subject"], second["advisory"]["subject"])
+        self.assertNotEqual(first["attempt"]["requestDigest"], second["attempt"]["requestDigest"])
+        self.assertEqual(first["attempt"]["consentSha256"], second["attempt"]["consentSha256"])
+        self.grant(256000)
+        third = self.invoke(extra=("--attempt-id", "c" * 32))[1]
+        self.assertFalse(third["cached"])
+        self.assertEqual(second["advisory"]["subject"], third["advisory"]["subject"])
+        self.assertNotEqual(second["attempt"]["consentSha256"], third["attempt"]["consentSha256"])
+        self.assertEqual(len({result["attempt"]["requestDigest"] for result in (first, second, third)}), 3)
+        ledger = consent._decision_ledger(consent._decision_ledger_path(self.workspace, "run-1"))
+        self.assertEqual(set(ledger["attempts"]),
+                         {result["attempt"]["requestDigest"] for result in (first, second, third)})
+        self.assertTrue(all(attempt["status"] == "completed" for attempt in ledger["attempts"].values()))
+        self.assertEqual(sum(attempt["chargedTokens"] for attempt in ledger["attempts"].values()), 3 * charge)
+        self.assertEqual(self.post.call_count, 3)
+
+    def test_legacy_character_cache_cannot_bypass_material_admission(self):
+        granted = self.grant(64000)
+        self.context["subject"]["passId"] = "character-terminal-review"
+        self.context["observations"]["nativeEvidence"] = {"provider": "character"}
+        self.write_inputs("quality-review")
+        detached = copy.deepcopy(self.context)
+        detached["bindings"] = [{"role": item["role"], "sha256": item["sha256"]}
+                                for item in detached["bindings"]]
+        full_sha = self.cli._context_digest(self.context)
+        detached_sha = self.cli._context_digest(detached)
+        request_sha = self.cli.digest(self.cli.canonical({
+            "contextDigest": full_sha, "providerContextDigest": detached_sha,
+            "consentSha256": granted["sha256"],
+            "assets": {name: image["sha256"] for name, image in self.assets.items()}}))
+        # Seed a valid old completed result without invoking the new material path.
+        generic = copy.deepcopy(self.context)
+        generic["subject"]["passId"] = "owned-generic-review"
+        generic["observations"].pop("nativeEvidence")
+        response = response_for(generic)
+        advisory = {"kind": "img2.decision-advisory", "version": 1,
+                    "group": "quality-review", "subject": self.context["subject"],
+                    "contextDigest": detached_sha, "model": response["model"],
+                    "answers": response["answers"], "usage": response["usage"]}
+        artifact = self.cli.PREFIX + "decisions/" + request_sha + ".json"
+        self.cli.write_artifact(self.workspace, artifact, advisory)
+        with consent.decision_session(self.workspace, "run-1") as session:
+            session.reserve(request_sha)
+            session.account(request_sha, response["usage"])
+            session.complete(request_sha, self.cli.digest(self.cli.canonical(advisory)))
+        ledger_path = consent._decision_ledger_path(self.workspace, "run-1")
+        before = ledger_path.read_bytes()
+        code, result = self.invoke("quality-review", extra=("--attempt-id", "b" * 32))
+        self.assertEqual(code, 2)
+        self.assertNotIn("advisory", result)
+        self.assertEqual(ledger_path.read_bytes(), before)
+        self.auth_mock.assert_not_called()
+        self.key_mock.assert_not_called()
+        self.post.assert_not_called()
+
     def test_malformed_paid_answer_accounts_valid_usage_without_retry(self):
         self.grant(64000)
         response = response_for(self.context)
