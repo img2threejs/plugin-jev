@@ -58,7 +58,7 @@ def prepare_image(path, *, crop=None):
     Caller owns consent and path/hash admission before invoking preparation.
     """
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image, ImageCms, ImageOps
     except ImportError:
         raise DecisionImageError("image dependency unavailable") from None
     try:
@@ -70,7 +70,22 @@ def prepare_image(path, *, crop=None):
                 upright = ImageOps.exif_transpose(original)
                 width, height = upright.size
                 bounds = _crop_bounds(crop, width, height)
-                region = upright.crop(bounds).convert("RGBA")
+                region = upright.crop(bounds)
+                profile = original.info.get("icc_profile")
+                if "icc_profile" in original.info:
+                    try:
+                        source_profile = ImageCms.ImageCmsProfile(io.BytesIO(profile))
+                        alpha = (region.convert("RGBA").getchannel("A")
+                                 if "A" in region.getbands() or "transparency" in region.info else None)
+                        color = region if region.mode in ("RGB", "CMYK", "LAB", "L") else region.convert("RGB")
+                        region = ImageCms.profileToProfile(
+                            color, source_profile, ImageCms.createProfile("sRGB"), outputMode="RGB").convert("RGBA")
+                        if alpha is not None:
+                            region.putalpha(alpha)
+                    except (ImageCms.PyCMSError, OSError, TypeError, ValueError):
+                        raise DecisionImageError("invalid or unsupported color profile") from None
+                else:
+                    region = region.convert("RGBA")
         crop_width, crop_height = region.size
         ratio = min(1.0, _MAX_SIDE / crop_width, _MAX_SIDE / crop_height)
         scaled_width = max(1, min(_MAX_SIDE, round(crop_width * ratio)))

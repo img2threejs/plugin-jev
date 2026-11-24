@@ -142,22 +142,12 @@ class IntegrationTests(unittest.TestCase):
         }
         return self.command(*args, expected=expected, env={**fake_env, **(env or {})})
     def load_jev_module(self):
-        tools_path = str(PLUGIN / "tools")
-        harness_path = str(HARNESS)
-        sys.path[:0] = [tools_path, harness_path]
-        stale_core = {name: sys.modules.pop(name) for name in list(sys.modules) if name == "img2_core" or name.startswith("img2_core.")}
-        try:
-            with mock.patch.dict(os.environ, {"IMG2_HOME": str(self.home)}):
-                spec = importlib.util.spec_from_file_location("jev_t2_transaction_test", PLUGIN / "tools" / "jev.py")
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
+        from _harness import linked_harness
+        with linked_harness(), mock.patch.dict(os.environ, {"IMG2_HOME": str(self.home)}):
+            spec = importlib.util.spec_from_file_location("jev_t2_transaction_test", PLUGIN / "tools" / "jev.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
             return module
-        finally:
-            for name in list(sys.modules):
-                if name == "img2_core" or name.startswith("img2_core."):
-                    sys.modules.pop(name)
-            sys.modules.update(stale_core)
-            del sys.path[:2]
 
     def prepare(self):
         return self.command("prepare", "--input", "observation.json")

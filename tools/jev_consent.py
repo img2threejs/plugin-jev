@@ -9,6 +9,8 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 import re
+import shutil
+import time
 
 POLICY_VERSION = "jev-disclosure-v3"
 DECISION_POLICY_VERSION = "jev-disclosure-v4"
@@ -212,27 +214,32 @@ def _private_json(path, default, maximum):
         os.close(fd)
 
 
-def _decision_entries(path):
+def _validate_decision_entry(entry):
+    fields = {"user", "workspace", "runId", "policyVersion", "generation", "enabled",
+              "purposes", "disclosures", "tokenBudget"}
+    if type(entry) is not dict or set(entry) != fields:
+        raise DecisionConsentError("consent-storage-error")
+    for field, size in (("user", 64), ("workspace", 64), ("generation", 32)):
+        if type(entry[field]) is not str or re.fullmatch("[0-9a-f]{" + str(size) + "}", entry[field]) is None:
+            raise DecisionConsentError("consent-storage-error")
+    _decision_id(entry["runId"])
+    if (entry["policyVersion"] != DECISION_POLICY_VERSION or type(entry["enabled"]) is not bool
+            or entry["purposes"] != list(DECISION_PURPOSES)
+            or entry["disclosures"] != list(DECISION_DISCLOSURES)
+            or type(entry["tokenBudget"]) is not int or not 0 < entry["tokenBudget"] <= 2**53 - 1):
+        raise DecisionConsentError("consent-storage-error")
+    return entry
+
+
+def _legacy_decision_entries(path):
     value = _private_json(path, {"kind": "img2.jev-decision-consents", "version": 4, "entries": []}, 128 * 1024)
     if (type(value) is not dict or set(value) != {"kind", "version", "entries"}
             or value["kind"] != "img2.jev-decision-consents" or type(value["version"]) is not int
             or value["version"] != 4 or type(value["entries"]) is not list or len(value["entries"]) > 128):
         raise DecisionConsentError("consent-storage-error")
     seen = set()
-    fields = {"user", "workspace", "runId", "policyVersion", "generation", "enabled",
-              "purposes", "disclosures", "tokenBudget"}
     for entry in value["entries"]:
-        if type(entry) is not dict or set(entry) != fields:
-            raise DecisionConsentError("consent-storage-error")
-        for field, size in (("user", 64), ("workspace", 64), ("generation", 32)):
-            if type(entry[field]) is not str or re.fullmatch("[0-9a-f]{" + str(size) + "}", entry[field]) is None:
-                raise DecisionConsentError("consent-storage-error")
-        _decision_id(entry["runId"])
-        if (entry["policyVersion"] != DECISION_POLICY_VERSION or type(entry["enabled"]) is not bool
-                or entry["purposes"] != list(DECISION_PURPOSES)
-                or entry["disclosures"] != list(DECISION_DISCLOSURES)
-                or type(entry["tokenBudget"]) is not int or not 0 < entry["tokenBudget"] <= 2**53 - 1):
-            raise DecisionConsentError("consent-storage-error")
+        _validate_decision_entry(entry)
         key = (entry["user"], entry["workspace"], entry["runId"])
         if key in seen:
             raise DecisionConsentError("consent-storage-error")
@@ -240,15 +247,144 @@ def _decision_entries(path):
     return value
 
 
-def _decision_entry(workspace, run_id, *, include_declined=False):
+def _private_directory(path, *, create=False):
+    if create:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = path.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o077):
+        raise DecisionConsentError("consent-storage-error")
+
+
+@contextmanager
+def _decision_lock(path, *, shared=False):
+    """Contention is explicit and bounded below the provider bridge deadline."""
+    _private_directory(path.parent, create=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        raise DecisionConsentError("consent-storage-error") from None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            raise DecisionConsentError("consent-storage-error")
+        deadline = time.monotonic() + 2.0
+        operation = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB
+        while True:
+            try:
+                fcntl.flock(fd, operation)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise DecisionConsentError("consent-busy") from None
+                time.sleep(0.01)
+        yield
+    finally:
+        _unlock_consent(fd)
+
+
+def _workspace_key(user, identity):
+    return hashlib.sha256((user + identity).encode()).hexdigest()
+
+
+def _run_name(run_id):
+    return "run-" + hashlib.sha256(run_id.encode()).hexdigest() + ".json"
+
+
+def _run_record(entry, generation="0" * 32, *, retired=False):
+    return {"version": 5, "entry": entry, "workspaceGeneration": generation, "retired": retired}
+
+
+def _decision_root(workspace):
+    """Publish the complete migration before fencing old binaries; one authority."""
+    legacy = _decision_path(workspace)
+    root = legacy.with_name("jev-decision-consents-v5")
+    with _decision_lock(legacy.with_name(legacy.name + ".lock")):
+        raw = _private_json(legacy, None, 128 * 1024)
+        if root.exists() or root.is_symlink():
+            _private_directory(root)
+            marker = _private_json(root / "migration.json", None, 1024)
+            if (type(marker) is not dict or set(marker) != {"version", "legacySha256"}
+                    or type(marker["version"]) is not int or marker["version"] != 5
+                    or type(marker["legacySha256"]) is not str
+                    or re.fullmatch("[0-9a-f]{64}", marker["legacySha256"]) is None):
+                raise DecisionConsentError("consent-storage-error")
+            if raw != marker:
+                # A crash between directory publication and the legacy fence is
+                # recoverable only if the original authority is byte-equivalent.
+                old = _legacy_decision_entries(legacy)
+                if _consent_digest(old) != marker["legacySha256"]:
+                    raise DecisionConsentError("consent-storage-error")
+                _store(legacy, marker)
+            return root
+        old = _legacy_decision_entries(legacy)
+        marker = {"version": 5, "legacySha256": _consent_digest(old)}
+        stage = Path(tempfile.mkdtemp(prefix=".jev-decision-migration-", dir=legacy.parent))
+        try:
+            for entry in old["entries"]:
+                directory = stage / _workspace_key(entry["user"], entry["workspace"])
+                _store(directory / _run_name(entry["runId"]), _run_record(entry))
+                # Ledgers stay at their one canonical identity/path, unchanged.
+                ledger_id = hashlib.sha256((entry["user"] + entry["workspace"] + entry["runId"]).encode()).hexdigest()
+                _decision_ledger(legacy.with_name("jev-decision-run-" + ledger_id + ".json"))
+            _store(stage / "migration.json", marker)
+            os.replace(stage, root)
+            _store(legacy, marker)
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage)
+        return root
+
+
+def _decision_workspace(workspace):
+    directory = _decision_root(workspace) / _workspace_key(_user_binding(), workspace_binding(workspace))
+    _private_directory(directory, create=True)
+    return directory
+
+
+def _decision_run_path(workspace, run_id):
     _decision_id(run_id)
-    user, identity = _user_binding(), workspace_binding(workspace)
-    for entry in _decision_entries(_decision_path(workspace))["entries"]:
-        if (entry["user"], entry["workspace"], entry["runId"]) == (user, identity, run_id):
-            if entry["enabled"] or include_declined:
-                return entry
-            raise DecisionConsentError("consent-declined")
-    raise DecisionConsentError("consent-required")
+    return _decision_workspace(workspace) / _run_name(run_id)
+
+
+def _workspace_generation(directory):
+    value = _private_json(directory / "workspace.json", {"generation": "0" * 32}, 1024)
+    if (type(value) is not dict or set(value) != {"generation"} or type(value["generation"]) is not str
+            or re.fullmatch("[0-9a-f]{32}", value["generation"]) is None):
+        raise DecisionConsentError("consent-storage-error")
+    return value["generation"]
+
+
+def _read_run(path):
+    value = _private_json(path, None, 4096)
+    if value is None and not path.exists():
+        return None
+    if (type(value) is not dict or set(value) != {"version", "entry", "workspaceGeneration", "retired"}
+            or type(value["version"]) is not int or value["version"] != 5
+            or type(value["retired"]) is not bool or type(value["workspaceGeneration"]) is not str
+            or re.fullmatch("[0-9a-f]{32}", value["workspaceGeneration"]) is None):
+        raise DecisionConsentError("consent-storage-error")
+    _validate_decision_entry(value["entry"])
+    return value
+
+
+def _decision_entry(workspace, run_id, *, include_declined=False):
+    path = _decision_run_path(workspace, run_id)
+    record = _read_run(path)
+    if record is None:
+        raise DecisionConsentError("consent-required")
+    entry = dict(record["entry"])
+    if (entry["user"], entry["workspace"], entry["runId"]) != (
+            _user_binding(), workspace_binding(workspace), run_id):
+        raise DecisionConsentError("consent-storage-error")
+    epoch = _workspace_generation(path.parent)
+    if record["workspaceGeneration"] != epoch or record["retired"]:
+        entry.update(enabled=False, generation=hashlib.sha256(
+            (entry["generation"] + epoch).encode()).hexdigest()[:32])
+    if entry["enabled"] or include_declined:
+        return entry
+    raise DecisionConsentError("consent-declined")
 
 
 def _consent_digest(entry):
@@ -271,45 +407,51 @@ def _set_decision_consent(workspace, run_id, token_budget, *, enabled):
     _decision_id(run_id)
     if type(token_budget) is not int or not 0 < token_budget <= 2**53 - 1:
         raise DecisionConsentError("invalid-budget")
-    path = _decision_path(workspace)
-    fd = _lock_consent(path)
-    try:
-        value = _decision_entries(path)
+    directory = _decision_workspace(workspace)
+    path = directory / _run_name(run_id)
+    with _decision_lock(directory / "workspace.lock", shared=True), _decision_lock(path.with_suffix(".lock")):
+        record = _read_run(path)
+        old = record["entry"] if record is not None else None
         user, identity = _user_binding(), workspace_binding(workspace)
-        old = next((item for item in value["entries"] if
-                    (item["user"], item["workspace"], item["runId"]) == (user, identity, run_id)), None)
-        if old is not None and token_budget < old["tokenBudget"]:
-            raise DecisionConsentError("invalid-budget")
-        # Reauthorization/extension never deletes the run's spent reservations.
+        if old is not None:
+            if (old["user"], old["workspace"], old["runId"]) != (user, identity, run_id):
+                raise DecisionConsentError("consent-storage-error")
+            if token_budget < old["tokenBudget"]:
+                raise DecisionConsentError("invalid-budget")
         entry = {"user": user, "workspace": identity, "runId": run_id,
                  "policyVersion": DECISION_POLICY_VERSION, "generation": uuid.uuid4().hex,
                  "enabled": enabled, "purposes": list(DECISION_PURPOSES),
                  "disclosures": list(DECISION_DISCLOSURES), "tokenBudget": token_budget}
-        value["entries"] = [item for item in value["entries"] if item is not old]
-        if len(value["entries"]) >= 128:
-            raise DecisionConsentError("consent-storage-error")
-        value["entries"].append(entry)
-        _store(path, value)
-    finally:
-        _unlock_consent(fd)
+        _store(path, _run_record(entry, _workspace_generation(directory)))
     return decision_consent_status(workspace, run_id, include_declined=True)
 
 
 def revoke_decision_consent(workspace, run_id=None):
-    if run_id is not None:
-        _decision_id(run_id)
-    path = _decision_path(workspace)
-    fd = _lock_consent(path)
-    try:
-        value = _decision_entries(path)
-        user, identity = _user_binding(), workspace_binding(workspace)
-        for entry in value["entries"]:
-            if (entry["user"] == user and entry["workspace"] == identity
-                    and (run_id is None or entry["runId"] == run_id)):
-                entry.update(enabled=False, generation=uuid.uuid4().hex)
-        _store(path, value)
-    finally:
-        _unlock_consent(fd)
+    directory = _decision_workspace(workspace)
+    if run_id is None:
+        # One atomic epoch update revokes every existing run, even after a crash.
+        with _decision_lock(directory / "workspace.lock"):
+            _store(directory / "workspace.json", {"generation": uuid.uuid4().hex})
+    else:
+        path = directory / _run_name(_decision_id(run_id))
+        with _decision_lock(directory / "workspace.lock", shared=True), _decision_lock(path.with_suffix(".lock")):
+            record = _read_run(path)
+            if record is not None:
+                record["entry"].update(enabled=False, generation=uuid.uuid4().hex)
+                _store(path, record)
+    return {"granted": False, "policyVersion": DECISION_POLICY_VERSION}
+
+
+def retire_decision_consent(workspace, run_id):
+    """Explicit retirement keeps the grant ceiling and all historical spend."""
+    path = _decision_run_path(workspace, run_id)
+    with _decision_lock(path.parent / "workspace.lock", shared=True), _decision_lock(path.with_suffix(".lock")):
+        record = _read_run(path)
+        if record is None:
+            raise DecisionConsentError("consent-required")
+        record["entry"].update(enabled=False, generation=uuid.uuid4().hex)
+        record["retired"] = True
+        _store(path, record)
     return {"granted": False, "policyVersion": DECISION_POLICY_VERSION}
 
 
@@ -338,10 +480,11 @@ def _decision_ledger(path):
     for key, attempt in ledger["attempts"].items():
         if (type(key) is not str or re.fullmatch("[0-9a-f]{64}", key) is None
                 or type(attempt) is not dict or set(attempt) != {"status", "chargedTokens", "resultSha256"}
-                or attempt["status"] not in ("in-flight", "charged", "completed", "over-budget")
+                or attempt["status"] not in ("in-flight", "charged", "completed", "over-budget", "rejected")
                 or type(attempt["chargedTokens"]) is not int or not 0 <= attempt["chargedTokens"] <= 2**54 - 2
                 or (attempt["status"] == "in-flight" and attempt["chargedTokens"] != DECISION_REQUEST_TOKENS)
                 or (attempt["status"] in ("charged", "completed") and attempt["chargedTokens"] > DECISION_REQUEST_TOKENS)
+                or (attempt["status"] == "rejected" and attempt["chargedTokens"] != 0)
                 or (attempt["status"] == "over-budget" and attempt["chargedTokens"] <= DECISION_REQUEST_TOKENS)
                 or (attempt["status"] != "completed" and attempt["resultSha256"] is not None)
                 or (attempt["status"] == "completed" and
@@ -367,15 +510,24 @@ class _DecisionSession:
         self.recheck()
         if type(request_digest) is not str or re.fullmatch("[0-9a-f]{64}", request_digest) is None:
             raise DecisionConsentError("context-fault")
-        if request_digest in self.ledger["attempts"]:
+        if (request_digest in self.ledger["attempts"]
+                and self.ledger["attempts"][request_digest]["status"] != "rejected"):
             raise DecisionConsentError("ambiguous-paid-attempt")
         spent = sum(item["chargedTokens"] for item in self.ledger["attempts"].values())
         if spent + DECISION_REQUEST_TOKENS > self.entry["tokenBudget"]:
             raise DecisionConsentError("budget-exhausted")
-        if len(self.ledger["attempts"]) >= 256:
+        if request_digest not in self.ledger["attempts"] and len(self.ledger["attempts"]) >= 256:
             raise DecisionConsentError("budget-storage-error")
         self.ledger["attempts"][request_digest] = {
             "status": "in-flight", "chargedTokens": DECISION_REQUEST_TOKENS, "resultSha256": None}
+        _store(self.path, self.ledger)
+
+    def reject(self, request_digest):
+        """Only a definite 401/403 for the current reserved attempt is releasable."""
+        attempt = self.ledger["attempts"].get(request_digest)
+        if attempt is None or attempt["status"] != "in-flight":
+            raise DecisionConsentError("budget-storage-error")
+        attempt.update(status="rejected", chargedTokens=0, resultSha256=None)
         _store(self.path, self.ledger)
 
     def account(self, request_digest, usage):
@@ -403,13 +555,7 @@ class _DecisionSession:
 
 @contextmanager
 def decision_session(workspace, run_id):
-    """Serialize all four edges with revocation and one durable per-run budget.
-
-    The grant lock spans asset reads and dispatch: revoke cannot complete while
-    an already-authorized dispatch is in progress. No later dispatch can race it.
-    """
-    fd = _lock_consent(_decision_path(workspace))
-    try:
+    """Serialize one run and order workspace revocation without blocking other workspaces."""
+    path = _decision_run_path(workspace, run_id)
+    with _decision_lock(path.parent / "workspace.lock", shared=True), _decision_lock(path.with_suffix(".lock")):
         yield _DecisionSession(workspace, run_id, _decision_entry(workspace, run_id))
-    finally:
-        _unlock_consent(fd)

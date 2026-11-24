@@ -23,9 +23,9 @@ import json
 
 from jev_decision_questions import (
     DecisionQuestionError, _canonical, _context_digest, _identifier, _number, _require,
-    _missing_evidence, _review_items, build_questions, validate_answers,
+    _missing_evidence, _review_items, _views, _placement_facts, build_questions, validate_answers,
 )
-from jev_decision_transport import post_systemone
+from jev_decision_transport import post_systemone, _credential_bytes
 
 # These are data-field names, never arbitrary user/provider map keys. Adding a
 # field or controlled term is a disclosure-policy change and requires tests.
@@ -181,6 +181,8 @@ def _routing_instances(value):
 
 
 def _project_data(value, field=None):
+    if field in {"requiredViews", "availableViews"}:
+        return list(_views(value))
     if field == "fieldPaths":
         if type(value) is not list:
             return _OMIT
@@ -252,6 +254,9 @@ def _project_state(context):
         }
     observations = _project_data(context["observations"])
     observations["images"] = [dict(image) for image in context["observations"].get("images", [])]
+    if "placement" in requirements:
+        projected_requirements["placement"] = dict(requirements["placement"])
+        observations["placementFacts"] = _placement_facts(context["observations"].get("placementFacts"))
     if context["group"] == "routing":
         request = requirements.get("request")
         if type(request) is dict:
@@ -340,7 +345,8 @@ def _wire_assets(state, questions, prepared, context_digest):
     return {references[key]: image for key, image in prepared.items()}
 
 
-def evaluate_context(context, *, api_key, assets=None, timeout=15.0):
+def evaluate_context(context, *, api_key, assets=None, timeout=15.0,
+                     before_send=None, on_response=None):
     """Consult the real transport using only explicitly prepared, consented data.
 
     Returns advisory evidence, never a canonical acceptance, execution plan or
@@ -366,9 +372,13 @@ def evaluate_context(context, *, api_key, assets=None, timeout=15.0):
     if prepared:
         payload["assets"] = prepared
     # Even a misplaced credential in an otherwise opaque id must not be sent.
-    _require(type(api_key) is str and bool(api_key), "invalid-credential")
-    _require(api_key.encode("utf-8") not in _canonical(payload), "credential-in-context")
-    response = post_systemone(payload, api_key, timeout=timeout)
+    _require(_credential_bytes(api_key) not in _canonical(payload), "credential-in-context")
+    options = {"timeout": timeout}
+    if before_send is not None:
+        options["before_send"] = before_send
+    response = post_systemone(payload, api_key, **options)
+    if on_response is not None:
+        on_response(response.get("usage") if type(response) is dict else None)
     validated = validate_answers(snapshot, response)
     return {
         "kind": "img2.decision-advisory", "version": 1,

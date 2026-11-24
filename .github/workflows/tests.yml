@@ -1,0 +1,36 @@
+name: Offline Python tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: img2threejs/img2
+          ref: 2ef0bb334d3000fdab95214ff2895f05e4cde0f0
+          path: _harness
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -r requirements-decisions.txt
+      - name: Full one-process discovery, no credentials
+        shell: bash
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/jev-home"
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/jev-home" \
+            IMG2_HARNESS_DIR="$PWD/_harness" PYTHONDONTWRITEBYTECODE=1 \
+            python -m unittest discover -s tests -v

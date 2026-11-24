@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed in 0.4.0
+
+- Validate and freeze full wire framing before durable reservation. Release only a definite
+  matching 401/403 rejection; retain ambiguous sends and account valid usage before answer validation.
+- Bind decision send/charge evidence to context, consent, logical request and a host invocation nonce.
+  Replay intact completed results without credential lookup; reject revoked or stale evidence.
+- Migrate v4 grants atomically to private per-workspace/run storage with old-version fencing,
+  independent run locks, bounded contention, atomic workspace revocation and explicit retirement.
+  Preserve all grant generations, historical spend and budget floors; remove the global 128-run ceiling.
+- Preserve bounded named/numeric views consistently and require hash-bound typed placement facts.
+- Convert embedded ICC color to sRGB before stripping metadata, preserve alpha, and sanitize corrupt PNGs.
+- Restore test import scopes without deleting shared core modules; add full one-process Python CI.
+
 ### Added
 
 - Add a separate `jev consult` checkpoint-review route for aggregate-only inventory, scene-analysis, and production-brief receipts. It validates context digests and local bindings before and after one bounded TypeSafe dispatch, uses fixed checkpoint Choice questions, persists advisory-only content-addressed results, and never mutates the existing repair recommendation or gate state.
@@ -36,7 +49,7 @@
   candidates from provider state; preserve typed absence and all existing controller gates.
   Scope missing-object judgment to omitted independently reconstructable foreground subjects, not
   background scenery or already-covered contained details. Other three decision-group versions remain unchanged.
-- Bump Jev to 0.3.0; old repair recommendation records are stale under the current plugin version. Repair-state-v2 question and policy semantics remain unchanged.
+- Bump Jev to 0.4.0; old repair/checkpoint recommendation records are stale under the current plugin version. Repair-state-v2 question and policy semantics remain unchanged.
 
 
 ### Added

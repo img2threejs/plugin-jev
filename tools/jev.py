@@ -37,18 +37,18 @@ from jev_auth import CredentialError, auth_status, login as login_credential, re
 from jev_consent import POLICY_VERSION as CONSENT_POLICY_VERSION, ConsentError, require_consent, set_consent
 from jev_projection import POLICY_VERSION as PROJECTION_POLICY_VERSION, project_state
 from jev_consent import (
-    DECISION_PURPOSES, DecisionConsentError,
+    DECISION_PURPOSES, DECISION_REQUEST_TOKENS, DecisionConsentError,
     decision_consent_status, decision_session, revoke_decision_consent, set_decision_consent,
-    decline_decision_consent,
+    decline_decision_consent, retire_decision_consent,
 )
-from jev_decision_questions import DecisionQuestionError, build_questions, _context_digest
+from jev_decision_questions import DecisionQuestionError, build_questions, _context_digest, placement_record_facts
 from jev_decision_provider import evaluate_context
 from jev_decision_transport import DecisionTransportError
 
 PREFIX = ".img2/artifacts/jev/"
 REQUEST_PATH = PREFIX + "repair-state.json"
 REPORT_PATH = PREFIX + "recommendation.json"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def emit(value):
@@ -894,18 +894,29 @@ def _decision_json(workspace, relative, maximum):
 
 
 def _decision_bindings(workspace, context):
+    placement = "placement" in context["requirements"]
+    records = {}
     for binding in context["bindings"]:
         if "path" not in binding:
             raise DecisionQuestionError("context-fault")
         with _decision_file(workspace, binding["path"]) as stream:
+            chunks = [] if placement and binding["role"] in {"camera", "depth", "support", "size-prior"} else None
             hasher, size = hashlib.sha256(), 0
             while chunk := stream.read(65536):
                 size += len(chunk)
                 if size > 64 * 1024 * 1024:
                     raise DecisionQuestionError("context-fault")
                 hasher.update(chunk)
+                if chunks is not None:
+                    if size > MAX_JSON_BYTES:
+                        raise DecisionQuestionError("missing-placement-evidence")
+                    chunks.append(chunk)
         if hasher.hexdigest() != binding["sha256"]:
             raise DecisionQuestionError("stale-evidence")
+        if chunks is not None:
+            records[binding["role"]] = decode(b"".join(chunks))
+    if placement and placement_record_facts(records) != context["observations"]["placementFacts"]:
+        raise DecisionQuestionError("missing-placement-evidence")
 
 
 def _decision_assets(context, assets):
@@ -946,12 +957,50 @@ def _decision_assets(context, assets):
             if (max(280, round((right - left) * transform["scaleX"])) != image["width"]
                     or max(280, round((bottom - top) * transform["scaleY"])) != image["height"]):
                 raise ValueError
-        except (ValueError, TypeError, KeyError, OSError, DecisionImageError, Image.DecompressionBombError):
+        except (ValueError, TypeError, KeyError, OSError, SyntaxError, DecisionImageError, Image.DecompressionBombError):
             raise DecisionQuestionError("invalid-assets") from None
     return assets
 
 
+def _decision_send_evidence(evidence):
+    if (type(evidence) is not dict or not {"sendState", "chargedTokens"} <= set(evidence)
+            or set(evidence) - {"sendState", "chargedTokens", "attempt"}):
+        raise DecisionQuestionError("context-fault")
+    state, charged = evidence["sendState"], evidence["chargedTokens"]
+    if (type(state) is not str or state not in {"not-sent", "possibly-sent", "rejected", "charged"}
+            or type(charged) is not int or not 0 <= charged <= 2**54 - 2
+            or (state in {"not-sent", "rejected"} and charged != 0)
+            or (state == "possibly-sent" and charged != DECISION_REQUEST_TOKENS)):
+        raise DecisionQuestionError("context-fault")
+    if "attempt" in evidence:
+        attempt = evidence["attempt"]
+        if (type(attempt) is not dict
+                or set(attempt) != {"contextDigest", "requestDigest", "consentSha256", "invocationDigest"}
+                or any(type(value) is not str or len(value) != 64
+                       or any(char not in "0123456789abcdef" for char in value)
+                       for value in attempt.values())):
+            raise DecisionQuestionError("context-fault")
+    return dict(evidence)
+
+
 def run_decision(workspace, args):
+    nonce = args.attempt_id if args.attempt_id is not None else uuid.uuid4().hex
+    if (type(nonce) is not str or len(nonce) != 32
+            or any(char not in "0123456789abcdef" for char in nonce)):
+        raise DecisionQuestionError("context-fault")
+    invocation_digest = hashlib.sha256(nonce.encode("ascii")).hexdigest()
+    evidence = {"sendState": "not-sent", "chargedTokens": 0}
+    try:
+        result = _run_decision(workspace, args, evidence, invocation_digest)
+    except Exception as error:
+        # Bound transport facts, never provider prose or a reason-code guess.
+        # Duplicate ambiguity preserves the unresolved request's liability.
+        error.decision_send_evidence = _decision_send_evidence(evidence)
+        raise
+    return {**result, **_decision_send_evidence(evidence)}
+
+
+def _run_decision(workspace, args, evidence, invocation_digest):
     context = _decision_json(workspace, args.input, 256 * 1024)
     questions = build_questions(context)
     if context["group"] != args.decision_group:
@@ -963,15 +1012,6 @@ def run_decision(workspace, args):
     # Consent is checked before opening the asset manifest or any bound image.
     with decision_session(workspace, context["subject"]["runId"]) as session:
         grant_sha = decision_consent_status(workspace, context["subject"]["runId"])["sha256"]
-        status = auth_status()
-        if status["status"] != "present":
-            raise DecisionConsentError(status["reasonCode"])
-        try:
-            key = resolve_api_key()
-        except CredentialError:
-            status = auth_status()
-            raise DecisionConsentError(status["reasonCode"] if status["status"] != "present"
-                                       else "credential-storage-error") from None
         assets = _decision_json(workspace, args.assets, 48 * 1024 * 1024) if args.assets else {}
         assets = _decision_assets(context, assets)
         _decision_bindings(workspace, context)
@@ -984,23 +1024,52 @@ def run_decision(workspace, args):
                                           "providerContextDigest": _context_digest(projected),
                                           "consentSha256": grant_sha,
                                           "assets": {name: image["sha256"] for name, image in assets.items()}}))
+        evidence["attempt"] = {"contextDigest": _context_digest(projected),
+                               "requestDigest": request_digest, "consentSha256": grant_sha,
+                               "invocationDigest": invocation_digest}
         artifact = PREFIX + "decisions/" + request_digest + ".json"
         prior = session.previous(request_digest)
         if prior is not None:
-            if prior["status"] != "completed":
+            if prior["status"] not in {"completed", "rejected"}:
+                state = "charged" if prior["status"] in {"charged", "over-budget"} else "possibly-sent"
+                evidence.update(sendState=state, chargedTokens=prior["chargedTokens"])
                 raise DecisionConsentError("ambiguous-paid-attempt")
-            result = _decision_json(workspace, artifact, MAX_JSON_BYTES)
-            if digest(canonical(result)) != prior["resultSha256"]:
-                raise DecisionQuestionError("cache-fault")
+            if prior["status"] == "completed":
+                result = _decision_json(workspace, artifact, MAX_JSON_BYTES)
+                if digest(canonical(result)) != prior["resultSha256"]:
+                    raise DecisionQuestionError("cache-fault")
+                session.recheck()
+                return {"status": "answered", "reasonCode": "answered", "artifact": artifact,
+                        "cached": True, "consentSha256": grant_sha, "advisory": result}
+        status = auth_status()
+        if status["status"] != "present":
+            raise DecisionConsentError(status["reasonCode"])
+        try:
+            key = resolve_api_key()
+        except CredentialError:
+            status = auth_status()
+            raise DecisionConsentError(status["reasonCode"] if status["status"] != "present"
+                                       else "credential-storage-error") from None
+        def reserve():
             session.recheck()
-            return {"status": "answered", "reasonCode": "answered", "artifact": artifact,
-                    "cached": True, "consentSha256": grant_sha, "advisory": result}
-        session.reserve(request_digest)
-        # The lock serializes revocation and every group; reserve is fsynced
-        # before I/O, and every failed/unknown send retains its full 64k charge.
-        session.recheck()
-        result = evaluate_context(projected, api_key=key, assets=assets, timeout=args.timeout)
-        session.account(request_digest, result["usage"])
+            session.reserve(request_digest)
+            evidence.update(sendState="possibly-sent", chargedTokens=DECISION_REQUEST_TOKENS)
+        def account(usage):
+            try:
+                session.account(request_digest, usage)
+            finally:
+                attempt = session.previous(request_digest)
+                if attempt is not None and attempt["status"] in {"charged", "over-budget"}:
+                    evidence.update(sendState="charged", chargedTokens=attempt["chargedTokens"])
+        try:
+            result = evaluate_context(projected, api_key=key, assets=assets, timeout=args.timeout,
+                                      before_send=reserve,
+                                      on_response=account)
+        except DecisionTransportError as error:
+            if error.reason_code == "credential-rejected":
+                session.reject(request_digest)
+                evidence.update(sendState="rejected", chargedTokens=0)
+            raise
         session.recheck()
         _decision_bindings(workspace, context)
         write_artifact(workspace, artifact, result)
@@ -1015,7 +1084,7 @@ def main(argv=None):
     commands.add_parser("login", help="Store a TypeSafe API key in macOS Keychain")
     commands.add_parser("auth-status", help="Report local credential presence without exposing the key")
     consent_command = commands.add_parser("consent", help="Authorize or revoke workspace disclosure")
-    consent_command.add_argument("action", choices=("authorize", "revoke", "authorize-decisions", "decline-decisions", "revoke-decisions", "decision-status"))
+    consent_command.add_argument("action", choices=("authorize", "revoke", "authorize-decisions", "decline-decisions", "revoke-decisions", "retire-decisions", "decision-status"))
     consent_command.add_argument("--workspace", default=None)
     consent_command.add_argument("--run-id")
     consent_command.add_argument("--token-budget", type=int)
@@ -1030,6 +1099,7 @@ def main(argv=None):
         sub.add_argument("--input", required=True, help="Trusted controller's workspace-relative typed context JSON")
         sub.add_argument("--assets", help="Workspace-relative JSON map of prepared image records (read only after v4 consent)")
         sub.add_argument("--timeout", type=float, default=15.0)
+        sub.add_argument("--attempt-id", help="Host-owned 32-hex invocation nonce; never a credential")
     for name in ("prepare", "route", "consult", "record-outcome", "replay", "report-outcomes"):
         sub = commands.add_parser(name)
         sub.add_argument("--workspace", default=None)
@@ -1057,7 +1127,7 @@ def main(argv=None):
             return {"present": 0, "missing": 3, "storage-error": 1}[result["status"]]
         workspace = resolve_workspace(args.workspace) if args.command != "consent" or args.workspace else resolve_workspace(None)
         if args.command == "consent":
-            if args.action in {"decision-status", "revoke-decisions"} and (
+            if args.action in {"decision-status", "revoke-decisions", "retire-decisions"} and (
                     args.token_budget is not None or args.accept_image_disclosure or args.accept_paid_calls):
                 raise DecisionConsentError("context-fault")
             if args.action == "authorize-decisions":
@@ -1071,6 +1141,8 @@ def main(argv=None):
                 result = decision_consent_status(workspace, args.run_id, include_declined=True)
             elif args.action == "revoke-decisions":
                 result = revoke_decision_consent(workspace, args.run_id)
+            elif args.action == "retire-decisions":
+                result = retire_decision_consent(workspace, args.run_id)
             else:
                 if (args.run_id is not None or args.token_budget is not None
                         or args.accept_image_disclosure or args.accept_paid_calls):
@@ -1105,6 +1177,8 @@ def main(argv=None):
                            "invalid-answer": "malformed", "invalid-answer-keys": "malformed",
                            "invalid-usage": "malformed", "model-mismatch": "malformed"}.get(reason_code, reason_code)
             result = {"kind": "img2.jev-command", "version": 1, "status": "request-input", "reasonCode": reason_code}
+            if args.command.startswith("decision-") and hasattr(err, "decision_send_evidence"):
+                result.update(err.decision_send_evidence)
             if reason_code in {"credential-missing", "credential-rejected", "credential-storage-error"}:
                 result["requestedCommand"] = "img2-jev login"
             emit(result)

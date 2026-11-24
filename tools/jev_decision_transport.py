@@ -301,11 +301,16 @@ def _run_worker(data, deadline):
     return result["response"]
 
 
-def post_systemone(payload, api_key, *, timeout=15.0):
-    """POST the full payload to TypeSafe, with one non-renewable total deadline."""
-    if (not isinstance(api_key, str) or not api_key or len(api_key) > 4096
+def _credential_bytes(api_key):
+    if (type(api_key) is not str or not api_key or len(api_key) > 4096
             or api_key != api_key.strip() or any(ord(c) < 33 or ord(c) > 126 for c in api_key)):
         raise DecisionTransportError("invalid-credential")
+    return api_key.encode("ascii")
+
+
+def post_systemone(payload, api_key, *, timeout=15.0, before_send=None):
+    """Validate/freeze the wire request before reserving, then launch once."""
+    _credential_bytes(api_key)
     try:
         valid_timeout = (not isinstance(timeout, bool) and isinstance(timeout, (int, float))
                          and math.isfinite(timeout) and timeout > 0)
@@ -317,8 +322,11 @@ def post_systemone(payload, api_key, *, timeout=15.0):
     body, content_type, images = _encode_request(payload)
     metadata = _json_bytes({"apiKey": api_key, "contentType": content_type,
                             "images": images, "deadline": deadline})
+    request = metadata + b"\n" + body
     _remaining(deadline)
-    return _run_worker(metadata + b"\n" + body, deadline)
+    if before_send is not None:
+        before_send()
+    return _run_worker(request, deadline)
 
 
 def _worker():

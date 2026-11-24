@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "jev",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Bounded four-purpose image-aware decision advisories plus legacy Environment checkpoint and repair advice; never acceptance authority.",
   "capabilities": [
     { "from": "repair-state", "to": "repair-recommendation" },

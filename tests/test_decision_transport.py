@@ -263,11 +263,12 @@ class WorkerBoundaryTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 3)
 
     def test_credential_error_survives_worker_boundary(self):
-        code = _CHILD_PREFIX + '\nResponse.status = 401\nnamespace["_worker"]()\n'
-        with self.spawn_stub(code):
-            with self.assertRaises(transport.DecisionTransportError) as caught:
-                transport.post_systemone(payload(), _SECRET, timeout=5)
-        self.assertEqual(caught.exception.reason_code, "credential-rejected")
+        for status in (401, 403):
+            code = _CHILD_PREFIX + f"\nResponse.status = {status}\nnamespace['_worker']()\n"
+            with self.subTest(status=status), self.spawn_stub(code):
+                with self.assertRaises(transport.DecisionTransportError) as caught:
+                    transport.post_systemone(payload(), _SECRET, timeout=5)
+            self.assertEqual(caught.exception.reason_code, "credential-rejected")
 
     def test_excess_worker_output_is_killed_and_not_exposed(self):
         code = 'import os, sys; sys.stdin.buffer.read(); os.write(1, b"private" * 1000000)'
@@ -282,6 +283,31 @@ class WorkerBoundaryTests(unittest.TestCase):
             with self.assertRaises(transport.DecisionTransportError) as caught:
                 transport.post_systemone(payload(), _SECRET)
         self.assertEqual(str(caught.exception), "provider-unavailable")
+
+
+    def test_wire_bytes_are_frozen_before_reservation_callback(self):
+        request = payload()
+        def reserve():
+            request["state"]["id"] = "changed-after-preflight"
+        with mock.patch.object(transport, "_run_worker", return_value=_ANSWER) as worker:
+            self.assertEqual(transport.post_systemone(request, _SECRET, before_send=reserve), _ANSWER)
+        metadata, wire = worker.call_args.args[0].split(b"\n", 1)
+        self.assertEqual(json.loads(wire)["state"]["id"], "object-a")
+        self.assertNotIn("changed-after-preflight", wire.decode())
+
+
+    def test_full_32mib_assets_reject_multipart_overhead_before_reservation(self):
+        encoded = base64.b64encode(b"x" * (16 * 1024 * 1024)).decode("ascii")
+        request = payload()
+        request["assets"] = {name: {"format": "png", "data_base64": encoded}
+                             for name in ("owned-asset-a", "owned-asset-b")}
+        reserve = mock.Mock()
+        with mock.patch.object(transport, "_run_worker") as worker:
+            with self.assertRaises(transport.DecisionTransportError) as caught:
+                transport.post_systemone(request, _SECRET, before_send=reserve)
+        self.assertEqual(caught.exception.reason_code, "request-too-large")
+        reserve.assert_not_called()
+        worker.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ python3 "$SKILL_DIR/tools/jev.py" consent authorize-decisions --workspace "$PWD"
   --run-id run-1 --token-budget 256000 --accept-image-disclosure --accept-paid-calls
 python3 "$SKILL_DIR/tools/jev.py" consent decision-status --workspace "$PWD" --run-id run-1
 python3 "$SKILL_DIR/tools/jev.py" consent revoke-decisions --workspace "$PWD" --run-id run-1
+python3 "$SKILL_DIR/tools/jev.py" consent retire-decisions --workspace "$PWD" --run-id run-1
 ```
 
 Both acknowledgements and a positive integer budget are required. The command's success JSON includes
@@ -32,9 +33,15 @@ revokes v3 plus all v4 grants. Reauthorization changes the consent digest but ne
 Extend a budget only by repeating the authorization command with explicit user approval and a larger
 budget for the same run; a smaller budget is refused.
 
-V4 grants live in private user-owned `IMG2_HOME/config/jev-decision-consent.json`, not in shareable
-workspace artifacts. User, canonical workspace path and run id are bound locally. Copies/moves do
-not inherit grants. Per-run private ledgers survive command restarts and consent renewal.
+V4 grants live in private user-owned per-workspace/run files under
+`IMG2_HOME/config/jev-decision-consents-v5/`, never in shareable workspace artifacts.
+The first access atomically migrates the old v4 list with identical grants, generations, rights
+and budget floors; `jev-decision-consent.json` then becomes a v5 fence that old binaries refuse.
+An interrupted publication can resume only against the unchanged original authority; corruption
+fails closed. Existing canonical per-run ledger files and their spend are not moved or reset.
+There is no global 128-run list or automatic deletion. Explicit `retire-decisions` disables a run
+while retaining its ceiling and ledger; reenrollment cannot lower that ceiling or erase spending.
+User, canonical workspace path and run id remain bound locally; copies/moves do not inherit grants.
 
 ## Prepare the trusted handoff
 
@@ -53,6 +60,9 @@ raw paths, original raster files, wire-only records, extra fields and unprepared
 as assets. The CLI verifies actual image format/dimensions, stripped metadata, SHA-256 and transform
 shape; preparation provenance remains the trusted caller's responsibility. It does not invent images
 or evidence. Image-free numeric decisions use `{}` or omit `--assets`.
+Embedded ICC profiles are converted through ImageCms to sRGB before metadata removal.
+Alpha is preserved separately and then composited over white. Malformed/unsupported declared
+profiles are refused, not silently reinterpreted; EXIF-upright crop/Box transforms stay unchanged.
 
 Only safe workspace-relative regular files are opened: no absolute paths, parent traversal, symlinks,
 FIFOs or device files. Context JSON is bounded to 256 KiB; prepared assets JSON to 48 MiB; decoded
@@ -134,41 +144,79 @@ Strategy projection preserves known/approved interior operation enums, opaque `c
 authorization; source hashes are not disclosed. Unknown operations, arbitrary field-path text,
 `specFields` and `expectedMeasurements` remain omitted.
 
+Required/available views use the same vocabulary for question admission and disclosure: numeric
+angles in [0,360], or front/rear/back/left/right/top/bottom/side, front-left/front-right,
+rear-left/rear-right/back-left/back-right, three-quarter. Unknown names, filenames and prose reject
+locally. Dimension and critical-feature view requirements are preserved, not silently dropped.
+Image/binding roles such as `render` and `domain-pose-0` are independent opaque evidence identifiers;
+pose material images must not be relabeled normal-map diagnostics.
+
+Placement-size/yaw additionally require `observations.placementFacts` with these exact subobjects:
+
+- `camera`: type=perspective; position/target/up finite 3-vectors; fov (0,180), positive aspect/near/far.
+- `depth`: positive cameraDepth/relativeDepth; metricLandmark finite 3-vector; depth inside near/far.
+- `support`: mode=surface with opaque supportObjectId, or mode=free with supportObjectId=null.
+- `sizePrior`: positive minScale/maxScale 3-vectors, positive authoredMetricHeight, heightBand={min,max}.
+
+Bounds must be ordered and all magnitudes <=1e12. `placement_record_facts(records)` selects only
+these facts from the admitted camera/depth/support/size-prior producer records, never raw scene
+files or paths. The CLI parses the same hash-verified binding bytes and requires exact fact equality.
+The core producer must populate these observations from its real admitted records: hashes alone or
+missing facts return `missing-placement-evidence` before dispatch, never invented scale/orientation.
+
 Failure JSON exits 2 with `status=request-input` and a reason code. Missing/rejected credentials are
 `credential-missing` / `credential-rejected`, distinct from `credential-storage-error`, and name
 `img2-jev login`. Missing/refused consent, exhausted budget, stale evidence, malformed answers and
 provider failures never become fabricated success or implicit model fallback.
 
+Decision success/error envelopes also carry strictly typed `sendState` and `chargedTokens`:
+`not-sent`/`rejected` imply zero; `possibly-sent` retains 64000; `charged` reports only validated
+actual input+output usage (integer 0..2^54-2). HTTP413 and timeout are potentially sent even when
+the reason is `request-too-large`; a reason code alone never proves a no-send.
+When the request is validated, `attempt` binds contextDigest, requestDigest, consentSha256 and
+invocationDigest, each 64 lowercase hex characters. Hosts pass a fresh 32-lowercase-hex
+`--attempt-id`; invocationDigest is its SHA-256, never the raw nonce or a credential.
+Older callers may omit this flag and ignore the added fields; those callers cannot use them as
+accounting authority. A new consumer must match its own nonce, current context/consent and request
+identity, validate field types/ranges, and retain reservations for missing/malformed proof or ambiguity.
+An ambiguous duplicate reports the unresolved existing liability, not permission to erase it or add
+another billable retry. Completed cached replay reports not-sent/0 without erasing historical spend.
+The source-pinned core bridge/controller must consume this contract and align both journals before
+release qualification; these additive fields alone do not change an old controller's accounting.
+
 ## One shared durable budget and bounded attempts
 
-All four commands serialize on one user-owned consent lock and reserve **64,000 tokens per send**
-in the same per-run ledger, atomically persisted and fsynced before transport. The 64k assumption is
-the approved conservative model request bound, not a tighter provider-side `max_tokens` setting.
-Do not claim stronger remote enforcement: the adapter exposes no output-token control. Validated
-input+output usage replaces the reservation; unaccounted/failed sends retain all 64k. An observed
-over-64k result is recorded at its actual usage and blocked as `provider-token-bound-exceeded`.
+All four commands share one durable per-run budget, with an exclusive run lock and shared workspace
+lock; unrelated workspaces/runs do not wait through another POST. Local projection, credential,
+image and complete multipart validation finish before **64,000 tokens per send** is reserved,
+atomically persisted and fsynced immediately before worker launch using immutable prepared wire bytes.
+The 64k assumption is an approved conservative model bound, not a remote `max_tokens` setting.
+Validated usage is recorded before semantic answer validation; malformed/untrusted usage, timeout,
+5xx and process death retain the conservative reservation. Only a definite matching HTTP401/403
+rejection is durably released, permitting an explicit credential-corrected retry of that request.
+An over-64k result is recorded at actual usage and refused as `provider-token-bound-exceeded`.
 A budget below one full reservation cannot dispatch, even for a likely small request. Group changes,
 new processes, retries and reauthorization never reset spend. The base controller's own ceiling also
 continues to apply; the two guards count the same calls, not two separate spending allowances.
 
-Consent is rechecked before asset reads and immediately before dispatch, and after the response.
-The grant lock spans the request: revocation waits for an already-authorized request to finish;
-once revocation completes, later requests cannot race it. Bindings are rechecked before publication.
-Completed exact context/assets/consent replays reuse a hash-verified local artifact without a paid
-call. In-flight or unpublishable attempts are `ambiguous-paid-attempt`; this CLI does not silently
-retry them. Any explicitly approved new attempt still needs budget and a new consent generation.
+Consent is checked before assets, immediately before dispatch and after the response. Run revocation
+uses the same exclusive run lock; workspace-wide revocation exclusively locks the workspace and
+atomically changes its generation. Each lock wait is bounded to two seconds: `consent-busy` means
+the revocation/request did not complete, never implicit authorization or automatic fallback.
+Completed exact context/assets/consent replays verify current bindings and the saved result hash before
+credential lookup, then reuse the artifact without network or extra spend. In-flight/unpublishable
+requests stay `ambiguous-paid-attempt`, with no silent retry. Bindings are rechecked before publication.
 No success cache is consumed after revocation. Receipts prove byte identity, not visual quality.
 
-## Proposed offline checks (run after integration)
+## Offline checks
 
 From the plugin repository, with `IMG2_HARNESS_DIR` set to the existing local harness checkout:
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_decision_enrollment.py' -v
-python3 -m unittest discover -s tests -p 'test_consent.py' -v
-python3 -m unittest discover -s tests -p 'test_decision_provider.py' -v
-python3 -m unittest discover -s tests -p 'test_decision_questions.py' -v
-python3 -m unittest discover -s tests -p 'test_manifest.py' -v
+python3 -m unittest discover -s tests -v
 ```
 
 These fixture checks are not paid-service, held-out quality or installation qualification.
+Full discovery runs in one process; import scopes restore their paths/environment without deleting
+peer core modules. CI runs Python3.10/3.12 with the optional image dependency. Local tests must use
+disposable HOME/IMG2_HOME and no real credentials; fixture success is not live/native qualification.

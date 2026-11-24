@@ -1,6 +1,7 @@
 """Offline v4 enrollment/CLI probes. No Keychain, network, or paid calls."""
 
 import contextlib
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -71,9 +72,9 @@ class EnrollmentTests(_WorkspaceFixture):
         self.assertEqual(set(grant), {"granted", "purposes", "sha256", "tokenBudget"})
         self.assertEqual(grant["purposes"], ["routing", "build-strategy", "quality-review", "repair"])
         self.assertEqual(grant["tokenBudget"], 128000)
-        entry = json.loads(consent._decision_path(self.workspace).read_text())["entries"][0]
+        entry = json.loads(consent._decision_run_path(self.workspace, "run-1").read_text())["entry"]
         self.assertEqual(entry["disclosures"], ["image", "reference", "render"])
-        self.assertEqual(consent._decision_path(self.workspace).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(consent._decision_run_path(self.workspace, "run-1").stat().st_mode & 0o777, 0o600)
         with self.assertRaises(consent.DecisionConsentError):
             consent.decision_consent_status(self.workspace, "run-2")
         elsewhere = self.base / "elsewhere"
@@ -149,7 +150,7 @@ class EnrollmentTests(_WorkspaceFixture):
     def test_session_holds_the_same_lock_as_revocation_and_other_edges(self):
         import fcntl
         self.grant()
-        lock_path = consent._decision_path(self.workspace).with_name("jev-decision-consent.json.lock")
+        lock_path = consent._decision_run_path(self.workspace, "run-1").with_suffix(".lock")
         with consent.decision_session(self.workspace, "run-1"):
             descriptor = os.open(lock_path, os.O_RDWR)
             try:
@@ -168,8 +169,8 @@ class EnrollmentTests(_WorkspaceFixture):
 
     def test_explicit_decline_has_private_stable_identity_without_v3_enrollment(self):
         declined = consent.decline_decision_consent(self.workspace, "run-1", 64000)
-        path = consent._decision_path(self.workspace)
-        entry = json.loads(path.read_text())["entries"][0]
+        path = consent._decision_run_path(self.workspace, "run-1")
+        entry = json.loads(path.read_text())["entry"]
         actual_digest = hashlib.sha256(json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         self.assertEqual(declined, {
             "granted": False, "purposes": [], "sha256": actual_digest, "tokenBudget": 64000})
@@ -244,7 +245,7 @@ class EnrollmentTests(_WorkspaceFixture):
 
     def test_disabled_status_rejects_malformed_or_nonprivate_storage(self):
         declined = consent.decline_decision_consent(self.workspace, "run-1", 64000)
-        path = consent._decision_path(self.workspace)
+        path = consent._decision_run_path(self.workspace, "run-1")
         original = path.read_bytes()
         for malformed in (b"{", b'{"kind":null,"kind":null}', b"null"):
             path.write_bytes(malformed)
@@ -295,8 +296,14 @@ class DecisionCliTests(_WorkspaceFixture):
         (self.home / "harness").symlink_to(harness, target_is_directory=True)
         spec = importlib.util.spec_from_file_location("jev_decision_enrollment_cli", TOOLS / "jev.py")
         self.cli = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.cli)
-        self.network = mock.patch.object(provider, "post_systemone", side_effect=AssertionError("unexpected network"))
+        from _harness import linked_harness
+        with linked_harness():
+            spec.loader.exec_module(self.cli)
+        import jev_decision_transport as transport
+        capture = mock.patch.object(provider, "post_systemone", wraps=provider.post_systemone)
+        self.transport_call = capture.start()
+        self.addCleanup(capture.stop)
+        self.network = mock.patch.object(transport, "_run_worker", side_effect=AssertionError("unexpected network"))
         self.post = self.network.start()
         self.addCleanup(self.network.stop)
         self.auth = mock.patch.object(self.cli, "auth_status", return_value={"status": "present", "reasonCode": "credential-present"})
@@ -354,14 +361,13 @@ class DecisionCliTests(_WorkspaceFixture):
         self.key_mock.assert_not_called()
         self.post.assert_not_called()
 
-    def test_missing_login_requests_user_and_stops_before_asset_read(self):
+    def test_missing_login_requests_user_without_reservation_or_dispatch(self):
         self.grant()
         self.auth_mock.return_value = {"status": "missing", "reasonCode": "credential-missing"}
-        with mock.patch.object(self.cli, "_decision_json", wraps=self.cli._decision_json) as reads:
-            code, result = self.invoke()
+        code, result = self.invoke()
         self.assertEqual((code, result["reasonCode"]), (2, "credential-missing"))
         self.assertEqual(result["requestedCommand"], "img2-jev login")
-        self.assertEqual(reads.call_count, 1)
+        self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
         self.key_mock.assert_not_called()
         self.post.assert_not_called()
 
@@ -396,13 +402,13 @@ class DecisionCliTests(_WorkspaceFixture):
             self.assertNotEqual(result["advisory"]["contextDigest"], original_digest)
             self.assertTrue(all("path" in item for item in self.context["bindings"]))
             self.assertEqual(self.post.call_count, before + 1)
-            payload, key = self.post.call_args.args
+            payload, key = self.transport_call.call_args.args
             self.assertEqual(key, KEY)
             self.assertNotIn("private", json.dumps(payload))
             self.assertEqual(set(payload["assets"]),
                              {image["asset"] for image in payload["state"]["observations"]["images"]})
             self.assertEqual(len(payload["assets"]), len(self.assets))
-            self.assertEqual(self.post.call_args.kwargs["timeout"], 15.0)
+            self.assertEqual(self.transport_call.call_args.kwargs["timeout"], 15.0)
             code, replay = self.invoke(group)
             self.assertEqual(code, 0)
             self.assertTrue(replay["cached"])
@@ -427,12 +433,12 @@ class DecisionCliTests(_WorkspaceFixture):
         self.assertEqual(attempt["chargedTokens"], 168)
         self.assertIsNone(attempt["resultSha256"])
 
-    def test_rejected_credential_retains_reservation_and_does_not_silently_retry(self):
+    def test_timeout_retains_reservation_and_does_not_silently_retry(self):
         self.grant(64000)
-        self.post.side_effect = DecisionTransportError("credential-rejected")
+        self.post.side_effect = DecisionTransportError("provider-timeout")
         code, result = self.invoke()
-        self.assertEqual((code, result["reasonCode"]), (2, "credential-rejected"))
-        self.assertEqual(result["requestedCommand"], "img2-jev login")
+        self.assertEqual((code, result["reasonCode"]), (2, "timeout"))
+        self.assertNotIn("requestedCommand", result)
         code, result = self.invoke()
         self.assertEqual((code, result["reasonCode"]), (2, "ambiguous-paid-attempt"))
         self.post.assert_called_once()
@@ -459,9 +465,9 @@ class DecisionCliTests(_WorkspaceFixture):
         original = self.cli._decision_assets
         def changed(context, assets):
             result = original(context, assets)
-            path = consent._decision_path(self.workspace)
+            path = consent._decision_run_path(self.workspace, "run-1")
             stored = json.loads(path.read_text())
-            stored["entries"][0]["enabled"] = False
+            stored["entry"]["enabled"] = False
             consent._store(path, stored)
             return result
         with mock.patch.object(self.cli, "_decision_assets", side_effect=changed):
@@ -582,7 +588,7 @@ class DecisionCliTests(_WorkspaceFixture):
 
     def test_decision_status_cli_refuses_corrupt_or_public_private_entry(self):
         consent.decline_decision_consent(self.workspace, "run-1", 64000)
-        path = consent._decision_path(self.workspace)
+        path = consent._decision_run_path(self.workspace, "run-1")
         path.chmod(0o644)
         code, result = self.invoke_consent("decision-status", ("--run-id", "run-1"))
         self.assertEqual((code, result["reasonCode"]), (2, "consent-storage-error"))
@@ -619,6 +625,183 @@ class DecisionCliTests(_WorkspaceFixture):
                 self.assertEqual((code, result["reasonCode"]), (2, "context-fault"))
                 assets.assert_not_called()
         self.post.assert_not_called()
+
+    def test_rejected_credentials_release_only_this_attempt_for_explicit_retry(self):
+        self.grant(64000)
+        self.post.side_effect = DecisionTransportError("credential-rejected")
+        rejected = self.invoke(extra=("--attempt-id", "a" * 32))[1]
+        self.assertEqual(rejected["reasonCode"], "credential-rejected")
+        self.assertEqual((rejected["sendState"], rejected["chargedTokens"]), ("rejected", 0))
+        self.assertEqual(rejected["requestedCommand"], "img2-jev login")
+        ledger = consent._decision_ledger(consent._decision_ledger_path(self.workspace, "run-1"))
+        attempt = next(iter(ledger["attempts"].values()))
+        self.assertEqual((attempt["status"], attempt["chargedTokens"]), ("rejected", 0))
+        self.post.side_effect = None
+        self.post.return_value = response_for(self.context)
+        code, result = self.invoke(extra=("--attempt-id", "b" * 32))
+        self.assertEqual(code, 0)
+        self.assertFalse(result["cached"])
+        self.assertEqual((result["sendState"], result["chargedTokens"]), ("charged", 168))
+        self.assertEqual(rejected["attempt"]["requestDigest"], result["attempt"]["requestDigest"])
+        self.assertNotEqual(rejected["attempt"]["invocationDigest"], result["attempt"]["invocationDigest"])
+        self.assertEqual(self.post.call_count, 2)
+        replay = self.invoke()[1]
+        self.assertTrue(replay["cached"])
+        self.assertEqual((replay["sendState"], replay["chargedTokens"]), ("not-sent", 0))
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_invalid_credential_and_credential_in_context_never_reserve(self):
+        self.grant(64000)
+        for key in (" invalid-key", "é", "\ud800", "bad\nkey"):
+            self.key_mock.return_value = key
+            with self.subTest(key=repr(key)):
+                self.assertEqual(self.invoke()[1]["reasonCode"], "invalid-credential")
+                self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
+        self.key_mock.return_value = KEY
+        self.context["candidates"][0]["id"] = KEY
+        self.write_inputs()
+        self.assertEqual(self.invoke()[1]["reasonCode"], "credential-in-context")
+        self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
+        self.post.assert_not_called()
+
+    def test_multipart_framing_limit_never_reserves_or_launches_worker(self):
+        import jev_decision_transport as transport
+        self.grant(64000)
+        # Image bytes fit; only the complete multipart envelope exceeds this cap.
+        with mock.patch.object(transport, "_MAX_REQUEST_BYTES", 2048):
+            self.assertEqual(self.invoke()[1]["reasonCode"], "request-too-large")
+        self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
+        self.post.assert_not_called()
+
+    def test_completed_replay_never_looks_up_credentials(self):
+        self.grant(64000)
+        self.post.side_effect = None
+        self.post.return_value = response_for(self.context)
+        first = self.invoke()[1]
+        self.auth_mock.side_effect = AssertionError("cached request looked up credentials")
+        self.key_mock.side_effect = AssertionError("cached request resolved credentials")
+        code, replay = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertTrue(replay["cached"])
+        self.assertEqual(replay["advisory"], first["advisory"])
+        self.post.assert_called_once()
+        artifact = self.workspace / first["artifact"]
+        original = artifact.read_bytes()
+        altered = json.loads(original)
+        altered["usage"]["input_tokens"] += 1
+        artifact.write_text(json.dumps(altered))
+        self.assertEqual(self.invoke()[1]["reasonCode"], "cache-fault")
+        artifact.write_bytes(original)
+        (self.workspace / self.context["bindings"][0]["path"]).write_bytes(b"changed bound evidence")
+        self.assertEqual(self.invoke()[1]["reasonCode"], "stale-evidence")
+        consent.revoke_decision_consent(self.workspace, "run-1")
+        self.assertEqual(self.invoke()[1]["reasonCode"], "consent-declined")
+        self.post.assert_called_once()
+
+    def test_malformed_paid_answer_accounts_valid_usage_without_retry(self):
+        self.grant(64000)
+        response = response_for(self.context)
+        response["answers"] = {}
+        self.post.side_effect = None
+        self.post.return_value = response
+        self.assertEqual(self.invoke()[1]["reasonCode"], "malformed")
+        ledger = consent._decision_ledger(consent._decision_ledger_path(self.workspace, "run-1"))
+        attempt = next(iter(ledger["attempts"].values()))
+        self.assertEqual((attempt["status"], attempt["chargedTokens"]), ("charged", 168))
+        self.assertEqual(self.invoke()[1]["reasonCode"], "ambiguous-paid-attempt")
+        self.post.assert_called_once()
+
+    def test_corrupt_png_checksum_returns_sanitized_envelope_before_reservation(self):
+        self.grant()
+        name = next(iter(self.assets))
+        image = self.assets[name]
+        data = bytearray(base64.b64decode(image["data_base64"]))
+        offset = data.index(b"IDAT")
+        length = int.from_bytes(data[offset - 4:offset], "big")
+        data[offset + 4 + length] ^= 1
+        image.update(data_base64=base64.b64encode(data).decode(),
+                     sha256=hashlib.sha256(data).hexdigest())
+        self.write_inputs()
+        code, result = self.invoke()
+        self.assertEqual((code, result["reasonCode"]), (2, "invalid-assets"))
+        self.assertNotIn(str(self.workspace), json.dumps(result))
+        self.assertFalse(consent._decision_ledger_path(self.workspace, "run-1").exists())
+        self.post.assert_not_called()
+
+
+    def test_invalid_usage_keeps_the_full_ambiguous_reservation(self):
+        self.grant(64000)
+        response = response_for(self.context)
+        response["usage"]["input_tokens"] = True
+        self.post.side_effect = None
+        self.post.return_value = response
+        self.assertEqual(self.invoke()[1]["reasonCode"], "malformed")
+        ledger = consent._decision_ledger(consent._decision_ledger_path(self.workspace, "run-1"))
+        self.assertEqual(next(iter(ledger["attempts"].values()))["chargedTokens"], 64000)
+        self.assertEqual(self.invoke()[1]["reasonCode"], "ambiguous-paid-attempt")
+        self.post.assert_called_once()
+
+    def test_placement_facts_match_hash_verified_producer_records_before_dispatch(self):
+        from test_placement_questions import context as placement_context
+        self.grant()
+        reference = next(iter(self.assets.values()))
+        self.context = placement_context("size")
+        self.context["subject"]["runId"] = "run-1"
+        self.assets = {"reference-image": reference}
+        facts = self.context["observations"]["placementFacts"]
+        for binding in self.context["bindings"]:
+            role = binding["role"]
+            binding["path"] = "placement/" + role + ".json"
+            path = self.workspace / binding["path"]
+            path.parent.mkdir(exist_ok=True)
+            record = facts.get("sizePrior" if role == "size-prior" else role, {})
+            path.write_text(json.dumps(dict(record, privatePath="/private/producer-record")))
+            binding["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.write_inputs("build-strategy")
+        self.post.side_effect = None
+        self.post.return_value = response_for(self.context)
+        self.assertEqual(self.invoke("build-strategy")[0], 0)
+        payload = self.transport_call.call_args.args[0]
+        self.assertEqual(payload["state"]["observations"]["placementFacts"], facts)
+        self.assertNotIn("/private/", json.dumps(payload))
+        self.context["observations"]["placementFacts"]["camera"]["fov"] += 1
+        self.write_inputs("build-strategy")
+        self.auth_mock.reset_mock()
+        self.assertEqual(self.invoke("build-strategy")[1]["reasonCode"], "missing-placement-evidence")
+        self.auth_mock.assert_not_called()
+        self.post.assert_called_once()
+
+
+    def test_send_envelope_distinguishes_preflight_from_413_and_binds_host_nonce(self):
+        self.grant(64000)
+        nonce = ("--attempt-id", "a" * 32)
+        self.key_mock.return_value = " invalid-key"
+        local = self.invoke(extra=nonce)[1]
+        self.assertEqual((local["reasonCode"], local["sendState"], local["chargedTokens"]),
+                         ("invalid-credential", "not-sent", 0))
+        self.key_mock.return_value = KEY
+        self.post.side_effect = DecisionTransportError("request-too-large")
+        remote = self.invoke(extra=("--attempt-id", "b" * 32))[1]
+        self.assertEqual((remote["reasonCode"], remote["sendState"], remote["chargedTokens"]),
+                         ("request-too-large", "possibly-sent", 64000))
+        for field in ("contextDigest", "requestDigest", "consentSha256"):
+            self.assertEqual(remote["attempt"][field], local["attempt"][field])
+        self.assertEqual(local["attempt"]["invocationDigest"], hashlib.sha256(b"a" * 32).hexdigest())
+        self.assertEqual(remote["attempt"]["invocationDigest"], hashlib.sha256(b"b" * 32).hexdigest())
+        self.post.assert_called_once()
+
+    def test_provider_cannot_forge_an_accounting_release_in_its_answer(self):
+        self.grant()
+        response = response_for(self.context)
+        response.update(sendState="rejected", chargedTokens=0,
+                        attempt={"requestDigest": "0" * 64})
+        self.post.side_effect = None
+        self.post.return_value = response
+        rejected = self.invoke()[1]
+        self.assertEqual(rejected["reasonCode"], "malformed")
+        self.assertEqual((rejected["sendState"], rejected["chargedTokens"]), ("charged", 168))
+        self.assertNotEqual(rejected["attempt"]["requestDigest"], "0" * 64)
+        self.post.assert_called_once()
 
 
 if __name__ == "__main__":

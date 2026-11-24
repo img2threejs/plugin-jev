@@ -610,6 +610,29 @@ class DecisionProviderTest(unittest.TestCase):
             self.assertNotIn(KEY, str(error.exception))
             post.assert_not_called()
 
+    def test_named_views_survive_requirements_dimensions_features_and_observations(self):
+        context = make_context("quality-review")
+        context["requirements"]["requiredViews"] = ["front", "front-left", 90]
+        context["requirements"]["dimensions"] = [{"id": "geometry", "requiredViews": ["front-left"]}]
+        context["requirements"]["criticalFeatures"][0]["requiredViews"] = ["front"]
+        context["observations"]["availableViews"] = ["front", "front-left", 90]
+        with mock.patch.object(provider, "post_systemone", return_value=response_for(context)) as post:
+            provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        state = post.call_args.args[0]["state"]
+        self.assertEqual(state["requirements"]["requiredViews"], ["front", "front-left", 90])
+        self.assertEqual(state["requirements"]["dimensions"][0]["requiredViews"], ["front-left"])
+        self.assertEqual(state["requirements"]["criticalFeatures"][0]["requiredViews"], ["front"])
+        self.assertEqual(state["observations"]["availableViews"], ["front", "front-left", 90])
+
+    def test_unknown_named_view_is_rejected_before_disclosure(self):
+        context = make_context("quality-review")
+        context["requirements"]["requiredViews"] = ["private-file.png"]
+        context["observations"]["availableViews"] = ["private-file.png"]
+        with mock.patch.object(provider, "post_systemone") as post:
+            with self.assertRaises(DecisionQuestionError):
+                provider.evaluate_context(context, api_key=KEY, assets=assets_for(context))
+        post.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,42 +1,19 @@
 import copy
-import importlib.util
-import os
-import shutil
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
-HARNESS_DIR = Path(os.environ.get("IMG2_HARNESS_DIR", PLUGIN_DIR.parent / "img2")).resolve()
-_TEST_HOME = None
+from _harness import linked_harness
+
 contracts = None
 policy = None
 
 
 def setUpModule():
-    global _TEST_HOME, contracts, policy
-    if not os.environ.get("IMG2_HOME"):
-        _TEST_HOME = Path(tempfile.mkdtemp(prefix="jev-outcome-img2-home-"))
-        (_TEST_HOME / "harness").symlink_to(HARNESS_DIR)
-        os.environ["IMG2_HOME"] = str(_TEST_HOME)
-    for name in ("jev_policy", "jev_contracts"):
-        spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "tools" / f"{name}.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        if name == "jev_policy":
-            policy = module
-        else:
-            contracts = module
-
-
-def tearDownModule():
-    if _TEST_HOME is not None:
-        os.environ.pop("IMG2_HOME", None)
-        shutil.rmtree(_TEST_HOME, ignore_errors=True)
+    global contracts, policy
+    with linked_harness():
+        import jev_policy as policy_module
+        import jev_contracts as contracts_module
+    policy, contracts = policy_module, contracts_module
 
 
 def metric(feature, value, direction="higher-is-better", unit="score"):

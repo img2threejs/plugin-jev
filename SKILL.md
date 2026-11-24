@@ -252,5 +252,8 @@ Requalify on any question, policy, normalizer or model upgrade. No historical ac
 ## Development verification
 
 Set `IMG2_HARNESS_DIR` to a local img2 checkout, then run `python3 -m unittest discover -s tests -v`
-from this plugin repo. Tests use temporary workspaces and no paid provider requests. Verify installation,
-capability resolution, `doctor`, `sync --check`, and the real gate runner against an isolated IMG2_HOME.
+from this plugin repo. Full discovery is the required one-process gate; Python3.10/3.12 CI also
+installs the optional image test dependency. Tests restore isolated harness imports and use only
+temporary workspaces and synthetic credentials, with no paid provider requests. Separately verify
+installation, capability resolution, `doctor`, `sync --check`, and the real gate runner against an
+isolated IMG2_HOME; offline fixture success does not qualify a real installation or native renderer.

@@ -7,14 +7,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-PLUGIN = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PLUGIN / "tools"))
+from _harness import linked_harness
 
-import jev_checkpoint as cp
-from jev_contracts import canonical, ContractError
-from jev_consent import ConsentError
-from jev_client import ProviderError
-from jev_checkpoint_client import validate_response as validate_checkpoint_response
+with linked_harness():
+    import jev_checkpoint as cp
+    from jev_contracts import canonical, ContractError
+    from jev_consent import ConsentError
+    from jev_client import ProviderError
+    from jev_checkpoint_client import validate_response as validate_checkpoint_response
 
 
 def answer(choice, options):
@@ -96,7 +96,9 @@ class CheckpointTests(unittest.TestCase):
         with self.assertRaises(ProviderError): validate_checkpoint_response(malformed)
 
     def test_cli_consult_smoke_uses_separate_result_envelope(self):
-        import contextlib, io, jev
+        import contextlib, io
+        with linked_harness():
+            import jev
         output=io.StringIO()
         with mock.patch.object(jev,"resolve_workspace",return_value=self.ws), contextlib.redirect_stdout(output):
             self.assertEqual(jev.main(["consult","--workspace",str(self.ws),"--input","context.json"]),0)

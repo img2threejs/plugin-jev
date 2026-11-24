@@ -141,10 +141,17 @@ def _no_execution(value):
             _no_execution(item)
 
 
+VIEW_NAMES = frozenset({
+    "front", "rear", "back", "left", "right", "top", "bottom", "side",
+    "front-left", "front-right", "rear-left", "rear-right", "back-left", "back-right",
+    "three-quarter",
+})
+
+
 def _views(value):
     _require(isinstance(value, list) and len(value) <= 32)
     for view in value:
-        _require(_identifier(view) or _number(view, 0, 360))
+        _require((type(view) is str and view in VIEW_NAMES) or _number(view, 0, 360))
     _require(len({(type(view), view) for view in value}) == len(value))
     return value
 
@@ -167,6 +174,61 @@ def _dimensions(context):
         result.append(item)
     _require(len({item["id"] for item in result}) == len(result))
     return result
+
+
+PLACEMENT_FACT_FIELDS = {
+    "camera": ("type", "position", "target", "up", "fov", "aspect", "near", "far"),
+    "depth": ("cameraDepth", "relativeDepth", "metricLandmark"),
+    "support": ("mode", "supportObjectId"),
+    "sizePrior": ("minScale", "maxScale", "authoredMetricHeight", "heightBand"),
+}
+
+
+def _placement_facts(facts):
+    reason = "missing-placement-evidence"
+    _require(type(facts) is dict and set(facts) == set(PLACEMENT_FACT_FIELDS), reason)
+    for role, fields in PLACEMENT_FACT_FIELDS.items():
+        _require(type(facts[role]) is dict and set(facts[role]) == set(fields), reason)
+    def vector(value, positive=False):
+        return (type(value) is list and len(value) == 3
+                and all(_number(item, 0 if positive else -1e12, 1e12)
+                        and (not positive or item > 0) for item in value))
+    camera, depth, support, prior = (facts[name] for name in PLACEMENT_FACT_FIELDS)
+    _require(camera["type"] == "perspective"
+             and all(vector(camera[name]) for name in ("position", "target", "up"))
+             and camera["position"] != camera["target"] and any(camera["up"])
+             and _number(camera["fov"], 0, 180) and 0 < camera["fov"] < 180
+             and all(_number(camera[name], 0, 1e12) and camera[name] > 0
+                     for name in ("aspect", "near", "far"))
+             and camera["near"] < camera["far"], reason)
+    _require(all(_number(depth[name], 0, 1e12) and depth[name] > 0
+                 for name in ("cameraDepth", "relativeDepth"))
+             and camera["near"] < depth["cameraDepth"] < camera["far"]
+             and vector(depth["metricLandmark"]), reason)
+    _require(support["mode"] in ("surface", "free")
+             and ((support["mode"] == "surface" and _identifier(support["supportObjectId"]))
+                  or (support["mode"] == "free" and support["supportObjectId"] is None)), reason)
+    _require(vector(prior["minScale"], True) and vector(prior["maxScale"], True)
+             and all(low <= high for low, high in zip(prior["minScale"], prior["maxScale"]))
+             and _number(prior["authoredMetricHeight"], 0, 1e12) and prior["authoredMetricHeight"] > 0, reason)
+    band = prior["heightBand"]
+    _require(type(band) is dict and set(band) == {"min", "max"}
+             and all(_number(band[name], 0, 1e12) for name in band)
+             and 0 < band["min"] <= band["max"], reason)
+    return facts
+
+
+def placement_record_facts(records):
+    """Project only facts actually present in the four admitted producer records."""
+    facts = {}
+    for role, fields in PLACEMENT_FACT_FIELDS.items():
+        record = records.get("size-prior" if role == "sizePrior" else role)
+        _require(type(record) is dict and set(fields) <= set(record), "missing-placement-evidence")
+        facts[role] = {name: copy.deepcopy(record[name]) for name in fields}
+    band = facts["sizePrior"]["heightBand"]
+    _require(type(band) is dict and {"min", "max"} <= set(band), "missing-placement-evidence")
+    facts["sizePrior"]["heightBand"] = {name: band[name] for name in ("min", "max")}
+    return _placement_facts(facts)
 
 
 def _validate_context(context):
@@ -235,6 +297,7 @@ def _validate_context(context):
         _require(all(roles.count(role) == 1 for role in
                      ("reference", "inventory", "artifact", "size-prior", "camera", "depth", "support")),
                  "missing-placement-evidence")
+        _placement_facts(observations.get("placementFacts"))
         values = set()
         for candidate in candidates:
             _require(set(candidate) == {"id", "value"}, "invalid-placement-candidate")

@@ -15,6 +15,7 @@ from jev_transport import evaluate_checkpoint_bounded
 from jev_checkpoint_client import validate_response as validate_checkpoint_response
 
 KIND = "img2.jev-checkpoint-context"
+PLUGIN_VERSION = "0.4.0"
 QUESTION_SET_VERSION = "checkpoint-questions-v1"
 POLICY_VERSION = "checkpoint-advice-v1"
 CHECKPOINTS = {"inventory-review", "scene-analysis-review", "production-brief-review"}
@@ -170,7 +171,7 @@ def consult(workspace, input_path, timeout=15.0):
     if type(consent) is not dict or set(consent) != {"user", "workspace", "policyVersion", "generation"} or consent["policyVersion"] != CONSENT_POLICY_VERSION:
         return {"status": "not-consulted", "reasonCode": "consent-required"}
     consent_hash = hashlib.sha256(canonical(consent)).hexdigest()
-    cache_identity = hashlib.sha256(canonical({"contextSha256": context["contextSha256"], "consentHash": consent_hash, "consentPolicyVersion": CONSENT_POLICY_VERSION, "pluginVersion": "0.3.0", "questions": QUESTION_SET_VERSION, "policy": POLICY_VERSION})).hexdigest()
+    cache_identity = hashlib.sha256(canonical({"contextSha256": context["contextSha256"], "consentHash": consent_hash, "consentPolicyVersion": CONSENT_POLICY_VERSION, "pluginVersion": PLUGIN_VERSION, "questions": QUESTION_SET_VERSION, "policy": POLICY_VERSION})).hexdigest()
     fd = _lock(workspace, cache_identity + ".lock")
     try:
         validate_context(workspace, context)
@@ -185,7 +186,7 @@ def consult(workspace, input_path, timeout=15.0):
                     record_path = contained(workspace, artifact)
                     if record_path.is_file() and not record_path.is_symlink():
                         result = read_json(workspace, artifact)
-                        if hashlib.sha256(canonical(result)).hexdigest() == index["recordSha256"] and type(result) is dict and set(result) == {"kind", "version", "pluginVersion", "contextSha256", "consentHash", "consentPolicyVersion", "questionSetVersion", "policyVersion", "checkpoint", "provider", "suggestedAction", "authority", "usage", "elapsedMs"} and result.get("contextSha256") == context["contextSha256"] and result.get("consentHash") == consent_hash and result.get("pluginVersion") == "0.3.0" and result.get("version") == 1 and result.get("consentPolicyVersion") == CONSENT_POLICY_VERSION and result.get("questionSetVersion") == QUESTION_SET_VERSION and result.get("policyVersion") == POLICY_VERSION and result.get("kind") == "img2.jev-checkpoint-advisory" and result.get("checkpoint") == context["checkpoint"] and result.get("authority") == "advisory-only" and result.get("suggestedAction") in _ACTIONS and type(result.get("elapsedMs")) is int and result["elapsedMs"] >= 0:
+                        if hashlib.sha256(canonical(result)).hexdigest() == index["recordSha256"] and type(result) is dict and set(result) == {"kind", "version", "pluginVersion", "contextSha256", "consentHash", "consentPolicyVersion", "questionSetVersion", "policyVersion", "checkpoint", "provider", "suggestedAction", "authority", "usage", "elapsedMs"} and result.get("contextSha256") == context["contextSha256"] and result.get("consentHash") == consent_hash and result.get("pluginVersion") == PLUGIN_VERSION and result.get("version") == 1 and result.get("consentPolicyVersion") == CONSENT_POLICY_VERSION and result.get("questionSetVersion") == QUESTION_SET_VERSION and result.get("policyVersion") == POLICY_VERSION and result.get("kind") == "img2.jev-checkpoint-advisory" and result.get("checkpoint") == context["checkpoint"] and result.get("authority") == "advisory-only" and result.get("suggestedAction") in _ACTIONS and type(result.get("elapsedMs")) is int and result["elapsedMs"] >= 0:
                             from jev_checkpoint_client import validate_response
                             require(type(result.get("provider")) is dict and set(result["provider"]) == {"status", "response"} and result["provider"]["status"] == "evaluated", "invalid cached provider result")
                             validate_response(result["provider"]["response"])
@@ -200,7 +201,7 @@ def consult(workspace, input_path, timeout=15.0):
         if attempt_file.exists():
             require(attempt_file.is_file() and not attempt_file.is_symlink(), "unsafe checkpoint attempt marker")
             attempt = read_json(workspace, attempt_path)
-            require(type(attempt) is dict and set(attempt) == {"kind", "contextSha256", "consentHash", "consentPolicyVersion", "pluginVersion", "questionSetVersion", "policyVersion"} and attempt["kind"] == "img2.jev-checkpoint-attempt" and attempt["contextSha256"] == context["contextSha256"] and attempt["consentHash"] == consent_hash and attempt["consentPolicyVersion"] == CONSENT_POLICY_VERSION and attempt["pluginVersion"] == "0.3.0" and attempt["questionSetVersion"] == QUESTION_SET_VERSION and attempt["policyVersion"] == POLICY_VERSION, "invalid checkpoint attempt marker")
+            require(type(attempt) is dict and set(attempt) == {"kind", "contextSha256", "consentHash", "consentPolicyVersion", "pluginVersion", "questionSetVersion", "policyVersion"} and attempt["kind"] == "img2.jev-checkpoint-attempt" and attempt["contextSha256"] == context["contextSha256"] and attempt["consentHash"] == consent_hash and attempt["consentPolicyVersion"] == CONSENT_POLICY_VERSION and attempt["pluginVersion"] == PLUGIN_VERSION and attempt["questionSetVersion"] == QUESTION_SET_VERSION and attempt["policyVersion"] == POLICY_VERSION, "invalid checkpoint attempt marker")
             return {"status": "not-consulted", "reasonCode": "already-attempted"}
         try:
             key = resolve_api_key()
@@ -219,7 +220,7 @@ def consult(workspace, input_path, timeout=15.0):
         if current_consent.get("policyVersion") != CONSENT_POLICY_VERSION or hashlib.sha256(canonical(current_consent)).hexdigest() != consent_hash:
             return {"status": "not-consulted", "reasonCode": "consent-changed"}
         from jev_contracts import write_artifact
-        write_artifact(workspace, attempt_path, {"kind": "img2.jev-checkpoint-attempt", "contextSha256": context["contextSha256"], "consentHash": consent_hash, "consentPolicyVersion": CONSENT_POLICY_VERSION, "pluginVersion": "0.3.0", "questionSetVersion": QUESTION_SET_VERSION, "policyVersion": POLICY_VERSION})
+        write_artifact(workspace, attempt_path, {"kind": "img2.jev-checkpoint-attempt", "contextSha256": context["contextSha256"], "consentHash": consent_hash, "consentPolicyVersion": CONSENT_POLICY_VERSION, "pluginVersion": PLUGIN_VERSION, "questionSetVersion": QUESTION_SET_VERSION, "policyVersion": POLICY_VERSION})
         response = validate_checkpoint_response(evaluate_checkpoint_bounded(safe_projection, key, timeout=timeout))
         validate_context(workspace, context)
         current_consent = require_consent(workspace)
@@ -227,7 +228,7 @@ def consult(workspace, input_path, timeout=15.0):
             raise ContractError("workspace consent changed during consultation")
         action = suggested_action(response, context)
         require(action in _ACTIONS, "invalid advisory action")
-        record = {"kind": "img2.jev-checkpoint-advisory", "version": 1, "pluginVersion": "0.3.0", "contextSha256": context["contextSha256"], "consentHash": consent_hash, "consentPolicyVersion": CONSENT_POLICY_VERSION, "questionSetVersion": QUESTION_SET_VERSION, "policyVersion": POLICY_VERSION, "checkpoint": context["checkpoint"], "provider": {"status": "evaluated", "response": response}, "suggestedAction": action, "authority": "advisory-only", "usage": response["usage"], "elapsedMs": round((time.monotonic() - started) * 1000)}
+        record = {"kind": "img2.jev-checkpoint-advisory", "version": 1, "pluginVersion": PLUGIN_VERSION, "contextSha256": context["contextSha256"], "consentHash": consent_hash, "consentPolicyVersion": CONSENT_POLICY_VERSION, "questionSetVersion": QUESTION_SET_VERSION, "policyVersion": POLICY_VERSION, "checkpoint": context["checkpoint"], "provider": {"status": "evaluated", "response": response}, "suggestedAction": action, "authority": "advisory-only", "usage": response["usage"], "elapsedMs": round((time.monotonic() - started) * 1000)}
         record_hash = hashlib.sha256(canonical(record)).hexdigest()
         artifact = ARTIFACT_PREFIX + "records/" + record_hash + ".json"
         write_artifact(workspace, artifact, record)

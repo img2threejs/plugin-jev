@@ -1,29 +1,14 @@
 import copy
-import importlib.util
 import json
-import os
-import shutil
-import sys
-import tempfile
 import unittest
 import urllib.request
-from pathlib import Path
 from unittest import mock
 
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
-HARNESS_DIR = Path(os.environ.get("IMG2_HARNESS_DIR", PLUGIN_DIR.parent / "img2")).resolve()
-_TEST_HOME = None
-if not os.environ.get("IMG2_HOME"):
-    _TEST_HOME = Path(tempfile.mkdtemp(prefix="jev-client-img2-home-"))
-    (_TEST_HOME / "harness").symlink_to(HARNESS_DIR)
-    os.environ["IMG2_HOME"] = str(_TEST_HOME)
+from _harness import linked_harness
 
-_SPEC = importlib.util.spec_from_file_location("jev_client", PLUGIN_DIR / "tools" / "jev_client.py")
-assert _SPEC is not None and _SPEC.loader is not None
-client = importlib.util.module_from_spec(_SPEC)
-sys.modules["jev_client"] = client
-_SPEC.loader.exec_module(client)
+with linked_harness():
+    import jev_client as client
 
 
 class _FakeResponse:
@@ -231,9 +216,6 @@ class JevClientTest(unittest.TestCase):
 
 
 
-def tearDownModule():
-    if _TEST_HOME is not None and _TEST_HOME.exists():
-        shutil.rmtree(_TEST_HOME, ignore_errors=True)
 
 if __name__ == "__main__":
     unittest.main()

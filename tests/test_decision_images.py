@@ -158,6 +158,45 @@ class DecisionImageTests(unittest.TestCase):
             images.prepare_image(missing)
         self.assertNotIn(str(missing), str(caught.exception))
 
+    def test_embedded_rgb_profile_is_converted_to_srgb_before_metadata_removal(self):
+        from PIL import ImageCms
+        # Owned synthetic RGB color space: exchange the red/blue primaries of
+        # LittleCMS's generated profile, retaining a valid complete ICC record.
+        profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+        tags = {}
+        for index in range(int.from_bytes(profile[128:132], "big")):
+            start = 132 + index * 12
+            tags[bytes(profile[start:start + 4])] = (
+                int.from_bytes(profile[start + 4:start + 8], "big"),
+                int.from_bytes(profile[start + 8:start + 12], "big"))
+        red, size = tags[b"rXYZ"]
+        blue, blue_size = tags[b"bXYZ"]
+        self.assertEqual(size, blue_size)
+        profile[red:red + size], profile[blue:blue + size] = profile[blue:blue + size], profile[red:red + size]
+        source_profile = ImageCms.ImageCmsProfile(io.BytesIO(profile))
+        source = Image.new("RGB", (280, 280), (200, 70, 30))
+        expected = ImageCms.profileToProfile(source, source_profile, ImageCms.createProfile("sRGB"),
+                                             outputMode="RGB").getpixel((20, 20))
+        self.assertNotEqual(expected, source.getpixel((20, 20)))
+        path = self.root / "owned-color-space.png"
+        source.save(path, icc_profile=bytes(profile))
+        actual = self.decode(images.prepare_image(path)).getpixel((20, 20))
+        for value, reference in zip(actual, expected):
+            self.assertLessEqual(abs(value - reference), 1)
+        source = source.convert("RGBA")
+        source.putalpha(128)
+        source.save(path, icc_profile=bytes(profile))
+        actual = self.decode(images.prepare_image(path)).getpixel((20, 20))
+        for value, reference in zip(actual, expected):
+            composite = (reference * 128 + 255 * 127 + 127) // 255
+            self.assertLessEqual(abs(value - composite), 1)
+
+    def test_malformed_embedded_profile_is_refused_not_reinterpreted(self):
+        path = self.save((280, 280), icc_profile=b"owned-invalid-profile")
+        with self.assertRaises(images.DecisionImageError):
+            images.prepare_image(path)
+
+
 
 if __name__ == "__main__":
     unittest.main()
