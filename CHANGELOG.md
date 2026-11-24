@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added in 0.5.0
+
+- Add strict Character material-only policy/questions and an exact path-free, hash-bound evidence
+  lane. Refuse normal-only, incomplete inventory, missing physical pose coverage or inconsistent
+  renderer/pixel/camera/ROI facts before cache reuse or paid reservation.
+- Verify decoded source PNG/raw RGBA parity, including fractional alpha, before independently
+  matching full-frame prepared RGB pixels and transforms. Preserve existing image/envelope caps.
+- Keep generic quality behavior and historical cache/accounting liability unchanged; native
+  producer attestation, replay, installation and paired host-ledger qualification remain core-owned.
+- Advance manifest, repair CLI and checkpoint artifact version together to 0.5.0; no core/img2 pin
+  updates or implicit compatibility aliases.
+
 ### Fixed in 0.4.0
 
 - Validate and freeze full wire framing before durable reservation. Release only a definite

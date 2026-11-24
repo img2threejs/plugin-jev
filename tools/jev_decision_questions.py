@@ -23,6 +23,11 @@ import json
 import math
 import re
 
+from jev_character_material import (
+    QUESTIONS as CHARACTER_QUESTIONS, MaterialEvidenceError, is_material,
+    validate_context as validate_material_context,
+)
+
 MODEL = "jev-1.14.0"
 QUESTION_SET_VERSIONS = {
     "routing": "route-questions-v3",
@@ -239,7 +244,8 @@ def _validate_context(context):
     _require(isinstance(group, str) and group in _CONTEXT_KINDS)
     _require(context["kind"] == _CONTEXT_KINDS[group])
     _require(type(context["version"]) is int and context["version"] == 1)
-    _require(context["questionSetVersion"] == QUESTION_SET_VERSIONS[group])
+    expected_questions = CHARACTER_QUESTIONS if is_material(context) else QUESTION_SET_VERSIONS[group]
+    _require(context["questionSetVersion"] == expected_questions)
     _require(context["requestedModel"] == MODEL and _identifier(context["policyVersion"]))
     subject = context["subject"]
     _require(type(subject) is dict and set(subject) == {"runId", "objectId", "revision", "passId"})
@@ -339,6 +345,10 @@ def _validate_context(context):
         for obj in objects:
             member = by_id.get(obj["id"])
             _require(member is not None and all(obj[key] == member[key] for key in obj))
+    try:
+        validate_material_context(context)
+    except (MaterialEvidenceError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        raise DecisionQuestionError("invalid-material-evidence") from None
     return context
 
 
@@ -352,7 +362,7 @@ def _missing_evidence(context, item):
     views = requirements.get("requiredViews", []) + item.get("requiredViews", [])
     return {
         "missingRoles": sorted(required_roles - roles),
-        "missingImageRoles": sorted({"reference", "render"} - image_roles),
+        "missingImageRoles": sorted((required_roles if is_material(context) else {"reference", "render"}) - image_roles),
         "missingViews": list(dict.fromkeys(view for view in views if view not in available)),
     }
 

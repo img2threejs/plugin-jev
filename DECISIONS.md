@@ -240,3 +240,66 @@ These fixture checks are not paid-service, held-out quality or installation qual
 Full discovery runs in one process; import scopes restore their paths/environment without deleting
 peer core modules. CI runs Python3.10/3.12 with the optional image dependency. Local tests must use
 disposable HOME/IMG2_HOME and no real credentials; fixture success is not live/native qualification.
+
+## Character material v1 (plugin 0.5.0)
+
+Character quality is a strict separate protocol, not a normal-only quality fallback.
+Any character-terminal-review subject, nativeEvidence.provider=character, characterMaterial
+lane, or reserved material policy/question version requires all markers to agree:
+quality-review, native-character-material-policy-v1, character-material-questions-v1.
+Generic quality-review-questions-v1 is unchanged. Old material-looking success caches cannot
+cross this question-version boundary; no consent or spend is reset.
+
+observations.characterMaterial is exact-key, path-free data. The hash-bound
+character-material-capture binding must contain exactly the same normalized JSON.
+Its keys are version=1, mode=original-material-fixed-lighting-v1, provenance,
+pixels, renderer, lighting, configurationSha256, requiredParts, criticalFeatures,
+requiredVisualRoles, coverage and frames. Provenance has distinct candidate/producer/runtime
+{role,sha256} references to admitted bindings. These facts do not attest a native producer.
+
+Pixels are RGBA8, rawRowOrigin=bottom-left, pngRowOrigin=top-left, colorSpace=srgb,
+alphaMode=straight. Renderer is threejs with opaque revision, srgb output, no tone mapping,
+alpha=true, antialias=false, pixelRatio=1 and transparent-black clearColor.
+Lighting hides imported lights: hemisphere sky 16777215 / ground 4473924 / intensity 1;
+directional color 16777215 / intensity 3 / position [3,5,4] / target [0,0,0].
+configurationSha256 hashes canonical JSON {pixels,renderer,lighting}.
+
+Coverage is {clipIds,times,physicalViews:[0,90,180,270]}, with at least four distinct
+normalized fractions including 0 and 1. Every clip/time independently requires all four
+physical camera directions, exactly once. Directions derive from matrixWorld +Z back,
+with inclusive 1e-4 degree angular tolerance compared in the exact cardinal basis;
+there is no epsilon widening, label-based substitute or static-view compensation.
+
+Frame records have exactly index, role, sha256, rgbaRole, rgbaSha256, width, height,
+clipId, time, side, azimuth, camera and roi. Index is contiguous; role is render for zero,
+domain-pose-N otherwise. Camera is {role,sha256,projection,matrixWorld,projectionMatrix,viewport}.
+Its hash-bound source record has exactly glbSha256, baselineGlbSha256, clip, time, side,
+azimuth, matrixWorld and projectionMatrix; all facts are cross-checked. clipId is
+"clip-" plus SHA256 of the UTF-8 source clip string, not the raw clip name.
+projectionMatrix[15] is 1 for orthographic, 0 for perspective. ROI is
+{role,sha256,format:mask8,rowOrigin:bottom-left}, exactly width*height binary bytes,
+nonempty; it is never an implicit image crop.
+
+Image/binding roles are unique. requiredVisualRoles exactly equals uploaded image roles
+and includes reference, rest-render and every material frame. Five standard rubric axes
+and exactly part:<requiredParts id> / feature:<criticalFeatures id> critical inventory must
+all be evaluable, including every declared evidence role and view. Nonempty partial questions
+are not admission. Existing caps remain 32 images, 128 bindings, 256KiB context, 64MiB per
+bound file, and 32MiB complete multipart including overhead; no dropped views, cap increase,
+implicit splitting or extra send. Insufficient inventory/budget refuses before reservation.
+
+The CLI first checks source 8-bit RGB/RGBA PNG decoded upright RGBA against vertically flipped
+raw bytes, preserving fractional alpha. ICC/EXIF/transparency overrides are not accepted for
+material PNGs; an optional sRGB intent 0 chunk is allowed. It then independently checks every
+prepared visual against deterministic full-frame preparation of the same admitted source,
+using RGB pixels, dimensions and transform rather than PNG compression bytes.
+White-composited RGB is never RGBA provenance. All checks precede cache/auth/send.
+
+Core still owns original-material/source/runtime attestation, source clip/part roster,
+candidate binding and native replay. Source ddae08e fractional-alpha evidence is not
+qualification of unrelated assets or an older installed runtime. Core/img2 pins are not
+changed here and must be coordinated against the final Jev/Character SHAs.
+Cached advisory usage stays historical; a fresh nonce-bound not-sent/0 receipt settles
+only that invocation, never an earlier unresolved liability or a second historical debit.
+Paired core/Jev journals and installed/native qualification remain separate gates.
+

@@ -42,13 +42,14 @@ from jev_consent import (
     decline_decision_consent, retire_decision_consent,
 )
 from jev_decision_questions import DecisionQuestionError, build_questions, _context_digest, placement_record_facts
+from jev_character_material import is_material, validate_files as validate_material_files, MaterialEvidenceError
 from jev_decision_provider import evaluate_context
 from jev_decision_transport import DecisionTransportError
 
 PREFIX = ".img2/artifacts/jev/"
 REQUEST_PATH = PREFIX + "repair-state.json"
 REPORT_PATH = PREFIX + "recommendation.json"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def emit(value):
@@ -893,10 +894,33 @@ def _decision_json(workspace, relative, maximum):
         raise DecisionQuestionError("context-fault") from None
 
 
-def _decision_bindings(workspace, context):
+def _decision_bindings(workspace, context, assets=None):
     placement = "placement" in context["requirements"]
     records = {}
+    admitted = set()
+    if is_material(context):
+        by_role = {binding["role"]: binding for binding in context["bindings"]}
+        def read_material(role, maximum):
+            binding = by_role[role]
+            with _decision_file(workspace, binding["path"]) as stream:
+                if os.fstat(stream.fileno()).st_size > maximum:
+                    raise DecisionQuestionError("invalid-material-evidence")
+                data = stream.read(maximum + 1)
+            if len(data) > maximum or hashlib.sha256(data).hexdigest() != binding["sha256"]:
+                raise DecisionQuestionError("stale-evidence")
+            admitted.add(role)
+            return data
+        try:
+            from PIL import Image
+            validate_material_files(context, read_material, assets)
+        except ImportError:
+            raise DecisionQuestionError("image-dependency-unavailable") from None
+        except (MaterialEvidenceError, ValueError, TypeError, KeyError, OverflowError,
+                RecursionError, OSError, SyntaxError, Image.DecompressionBombError):
+            raise DecisionQuestionError("invalid-material-evidence") from None
     for binding in context["bindings"]:
+        if binding["role"] in admitted:
+            continue
         if "path" not in binding:
             raise DecisionQuestionError("context-fault")
         with _decision_file(workspace, binding["path"]) as stream:
@@ -1014,7 +1038,7 @@ def _run_decision(workspace, args, evidence, invocation_digest):
         grant_sha = decision_consent_status(workspace, context["subject"]["runId"])["sha256"]
         assets = _decision_json(workspace, args.assets, 48 * 1024 * 1024) if args.assets else {}
         assets = _decision_assets(context, assets)
-        _decision_bindings(workspace, context)
+        _decision_bindings(workspace, context, assets)
         # Local paths remain bound for freshness/cache identity, but the shared
         # controller validates the advisory against this exact detached context.
         projected = json.loads(canonical(context))
@@ -1071,7 +1095,7 @@ def _run_decision(workspace, args, evidence, invocation_digest):
                 evidence.update(sendState="rejected", chargedTokens=0)
             raise
         session.recheck()
-        _decision_bindings(workspace, context)
+        _decision_bindings(workspace, context, assets)
         write_artifact(workspace, artifact, result)
         session.complete(request_digest, digest(canonical(result)))
         return {"status": "answered", "reasonCode": "answered", "artifact": artifact,

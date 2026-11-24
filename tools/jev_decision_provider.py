@@ -20,6 +20,7 @@ import base64
 import binascii
 import hashlib
 import json
+import copy
 
 from jev_decision_questions import (
     DecisionQuestionError, _canonical, _context_digest, _identifier, _number, _require,
@@ -257,6 +258,11 @@ def _project_state(context):
     if "placement" in requirements:
         projected_requirements["placement"] = dict(requirements["placement"])
         observations["placementFacts"] = _placement_facts(context["observations"].get("placementFacts"))
+    if "characterMaterial" in context["observations"]:
+        build_questions(context)
+        # Already exact-schema validated by build_questions; never generic prose projection.
+        observations["characterMaterial"] = copy.deepcopy(context["observations"]["characterMaterial"])
+        observations["nativeEvidence"] = {"provider": "character"}
     if context["group"] == "routing":
         request = requirements.get("request")
         if type(request) is dict:

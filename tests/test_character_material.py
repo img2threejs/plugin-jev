@@ -1,5 +1,12 @@
 """Owned offline fixtures for the character material admission boundary."""
 import sys
+import copy
+import importlib.util
+import json
+import math
+import os
+import tempfile
+from unittest import mock
 import unittest
 from pathlib import Path
 
@@ -9,6 +16,11 @@ if str(TOOLS) not in sys.path:
 
 from jev_decision_questions import DecisionQuestionError, build_questions
 from test_decision_questions import make_context
+from _character_material_fixture import material_fixture, rewrite_binding, sync_manifest, canonical
+from test_decision_enrollment import _WorkspaceFixture, KEY
+from test_decision_questions import response_for
+import jev_decision_provider as provider
+import test_decision_enrollment as enrollment
 
 
 class CharacterMaterialAdmissionTests(unittest.TestCase):
@@ -20,6 +32,179 @@ class CharacterMaterialAdmissionTests(unittest.TestCase):
                 "provider": "character", "deterministic": deterministic}
             with self.subTest(deterministic=deterministic), self.assertRaises(DecisionQuestionError):
                 build_questions(context)
+
+    def test_complete_material_questions_and_projection_preserve_typed_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context, _ = material_fixture(directory)
+            questions = build_questions(context)
+            self.assertEqual(set(questions), {
+                "dimension:silhouette-proportions", "dimension:part-relationships", "dimension:geometry",
+                "dimension:material-appearance", "dimension:identity-features",
+                "critical:part:body", "critical:feature:identity"})
+            projected = provider._project_state(context)
+            self.assertEqual(projected["observations"]["characterMaterial"],
+                             context["observations"]["characterMaterial"])
+            self.assertNotIn("path", json.dumps(projected["observations"]["characterMaterial"]))
+
+    def test_incomplete_or_contradictory_material_contexts_refuse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, _ = material_fixture(directory)
+            mutations = [
+                lambda c: c.update(policyVersion="quality-v1"),
+                lambda c: c.update(questionSetVersion="quality-review-questions-v1"),
+                lambda c: c["observations"]["nativeEvidence"].update(provider="environment"),
+                lambda c: c["observations"]["characterMaterial"].update(mode="normal-only"),
+                lambda c: c["observations"]["characterMaterial"]["pixels"].update(alphaMode="premultiplied"),
+                lambda c: c["observations"]["characterMaterial"].update(configurationSha256="0"*64),
+                lambda c: c["observations"]["characterMaterial"].update(path="/private/fixture"),
+                lambda c: c["requirements"].update(dimensions=["geometry"]),
+                lambda c: c["requirements"]["criticalFeatures"].pop(),
+                lambda c: c["observations"]["images"].pop(),
+                lambda c: c["observations"]["characterMaterial"]["frames"].pop(),
+                lambda c: c["observations"]["characterMaterial"]["frames"][1]["camera"].update(
+                    matrixWorld=c["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"]),
+                lambda c: c["observations"]["characterMaterial"]["coverage"]["clipIds"].append("clip-"+"f"*64),
+                lambda c: c["observations"]["characterMaterial"]["renderer"].update(toneMapping="aces"),
+                lambda c: c["observations"]["characterMaterial"]["frames"][0]["camera"].update(projection="perspective"),
+            ]
+            for index, mutate in enumerate(mutations):
+                context = copy.deepcopy(source)
+                mutate(context)
+                with self.subTest(index=index), self.assertRaises(DecisionQuestionError):
+                    build_questions(context)
+
+    def test_cardinal_tolerance_is_inclusive_and_not_automatically_relaxed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, _ = material_fixture(directory)
+            for delta, accepted in [(0, True), (0.0000999, True), (0.0001, True),
+                                    (-0.0001, True), (0.0001001, False)]:
+                context = copy.deepcopy(source)
+                theta = math.radians(delta)
+                matrix = context["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"]
+                matrix[8], matrix[10] = math.sin(theta), math.cos(theta)
+                with self.subTest(delta=delta):
+                    if accepted:
+                        self.assertEqual(len(build_questions(context)), 7)
+                    else:
+                        with self.assertRaises(DecisionQuestionError):
+                            build_questions(context)
+
+    def test_cardinal_boundary_rejects_one_float_step_outside(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, _ = material_fixture(directory)
+            limit = math.tan(math.radians(1e-4))
+            for cross, accepted in [(limit, True), (math.nextafter(limit, math.inf), False)]:
+                context = copy.deepcopy(source)
+                matrix = context["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"]
+                matrix[8], matrix[10] = cross, 1
+                if accepted:
+                    self.assertEqual(len(build_questions(context)), 7)
+                else:
+                    with self.assertRaises(DecisionQuestionError):
+                        build_questions(context)
+
+
+class CharacterMaterialFileTests(_WorkspaceFixture):
+    def setUp(self):
+        super().setUp()
+        self.home.mkdir()
+        harness = Path(os.environ["IMG2_HARNESS_DIR"])
+        (self.home / "harness").symlink_to(harness, target_is_directory=True)
+        spec = importlib.util.spec_from_file_location("jev_material_cli", TOOLS / "jev.py")
+        self.cli = importlib.util.module_from_spec(spec)
+        from _harness import linked_harness
+        with linked_harness():
+            spec.loader.exec_module(self.cli)
+        self.context, self.assets = material_fixture(self.workspace)
+
+    def test_source_rgba_mismatch_refuses_even_with_fresh_hashes(self):
+        frame = self.context["observations"]["characterMaterial"]["frames"][0]
+        role = frame["rgbaRole"]
+        binding = next(item for item in self.context["bindings"] if item["role"] == role)
+        raw = bytearray((self.workspace / binding["path"]).read_bytes())
+        raw[3] ^= 1
+        frame["rgbaSha256"] = rewrite_binding(self.workspace, self.context, role, bytes(raw))
+        sync_manifest(self.workspace, self.context)
+        with self.assertRaises(DecisionQuestionError):
+            self.cli._decision_bindings(self.workspace, self.context)
+
+    def test_camera_metadata_cannot_disagree_with_bound_camera(self):
+        frame = self.context["observations"]["characterMaterial"]["frames"][0]
+        frame["azimuth"] = 90
+        sync_manifest(self.workspace, self.context)
+        with self.assertRaises(DecisionQuestionError):
+            self.cli._decision_bindings(self.workspace, self.context)
+
+    def test_real_decision_pipeline_and_cache_keep_original_charge(self):
+        self.grant(128000)
+        (self.workspace / "context.json").write_bytes(canonical(self.context))
+        (self.workspace / "assets.json").write_bytes(canonical(self.assets))
+        import jev_decision_transport as transport
+        with mock.patch.object(self.cli, "auth_status", return_value={"status": "present"}), \
+                mock.patch.object(self.cli, "resolve_api_key", return_value=KEY), \
+                mock.patch.object(transport, "_run_worker", side_effect=lambda *a, **k: response_for(self.context)) as worker:
+            code, first = enrollment.DecisionCliTests.invoke(
+                self, "quality-review", ("--attempt-id", "a"*32))
+            self.assertEqual(code, 0)
+            self.assertEqual((first["sendState"], first["chargedTokens"]), ("charged", 168))
+            code, second = enrollment.DecisionCliTests.invoke(
+                self, "quality-review", ("--attempt-id", "b"*32))
+            self.assertEqual(code, 0)
+            self.assertTrue(second["cached"])
+            self.assertEqual((second["sendState"], second["chargedTokens"]), ("not-sent", 0))
+            self.assertEqual(second["advisory"]["usage"], first["advisory"]["usage"])
+            worker.assert_called_once()
+
+    def test_roi_must_be_nonempty_binary_and_hash_bound(self):
+        for value in (b"\0"*15, b"\2"*15, b"\1"*14):
+            with self.subTest(value=value):
+                context = copy.deepcopy(self.context)
+                frame = context["observations"]["characterMaterial"]["frames"][0]
+                frame["roi"]["sha256"] = rewrite_binding(self.workspace, context, frame["roi"]["role"], value)
+                sync_manifest(self.workspace, context)
+                with self.assertRaises(DecisionQuestionError):
+                    self.cli._decision_bindings(self.workspace, context)
+
+    def test_manifest_cannot_disagree_with_context_even_with_fresh_hash(self):
+        lane = copy.deepcopy(self.context["observations"]["characterMaterial"])
+        lane["mode"] = "normal-only"
+        rewrite_binding(self.workspace, self.context, "character-material-capture", lane)
+        with self.assertRaises(DecisionQuestionError):
+            self.cli._decision_bindings(self.workspace, self.context)
+
+    def test_rgb_compression_bytes_are_not_used_as_pixel_provenance(self):
+        import base64
+        from PIL import Image
+        import io
+        assets = copy.deepcopy(self.assets)
+        record = assets["image-render"]
+        with Image.open(io.BytesIO(base64.b64decode(record["data_base64"]))) as image:
+            output = io.BytesIO()
+            image.save(output, format="PNG", compress_level=0)
+        data = output.getvalue()
+        import hashlib
+        self.assertNotEqual(data, base64.b64decode(record["data_base64"]))
+        record.update(data_base64=base64.b64encode(data).decode(), sha256=hashlib.sha256(data).hexdigest())
+        self.cli._decision_assets(self.context, assets)
+        self.cli._decision_bindings(self.workspace, self.context, assets)
+        self.grant(128000)
+        (self.workspace / "context.json").write_bytes(canonical(self.context))
+        (self.workspace / "assets.json").write_bytes(canonical(assets))
+        import jev_decision_transport as transport
+        with mock.patch.object(self.cli, "auth_status", return_value={"status": "present"}), \
+                mock.patch.object(self.cli, "resolve_api_key", return_value=KEY), \
+                mock.patch.object(transport, "_run_worker", side_effect=lambda *a, **k: response_for(self.context)) as worker:
+            code, result = enrollment.DecisionCliTests.invoke(self, "quality-review")
+            self.assertEqual(code, 0)
+            self.assertEqual((result["status"], result["sendState"], result["chargedTokens"]),
+                             ("answered", "charged", 168))
+            worker.assert_called_once()
+
+    def test_prepared_visual_must_match_its_bound_source(self):
+        with self.assertRaises(DecisionQuestionError):
+            self.cli._decision_bindings(self.workspace, self.context,
+                                       {**self.assets, "image-render": self.assets["image-reference"] | {
+                                           "transform": {**self.assets["image-reference"]["transform"], "padX": 0}}})
 
 
 if __name__ == "__main__":

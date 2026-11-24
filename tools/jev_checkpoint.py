@@ -15,7 +15,7 @@ from jev_transport import evaluate_checkpoint_bounded
 from jev_checkpoint_client import validate_response as validate_checkpoint_response
 
 KIND = "img2.jev-checkpoint-context"
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.5.0"
 QUESTION_SET_VERSION = "checkpoint-questions-v1"
 POLICY_VERSION = "checkpoint-advice-v1"
 CHECKPOINTS = {"inventory-review", "scene-analysis-review", "production-brief-review"}
