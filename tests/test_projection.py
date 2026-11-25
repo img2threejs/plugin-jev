@@ -1,42 +1,23 @@
 import copy
 import hashlib
 import json
-import os
-import shutil
-import sys
-import tempfile
 import unittest
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-HARNESS_DIR = Path(os.environ.get("IMG2_HARNESS_DIR", PLUGIN_DIR.parent / "img2")).resolve()
-_ORIGINAL_IMG2_HOME = os.environ.get("IMG2_HOME")
-_TEST_HOME = None
+from _harness import linked_harness
+
 projection = None
 contracts = None
 
 
 def setUpModule():
-    global _TEST_HOME, projection, contracts
-    _TEST_HOME = Path(tempfile.mkdtemp(prefix="jev-projection-img2-home-"))
-    (_TEST_HOME / "harness").symlink_to(HARNESS_DIR)
-    os.environ["IMG2_HOME"] = str(_TEST_HOME)
-    sys.path[:0] = [str(PLUGIN_DIR / "tools"), str(HARNESS_DIR)]
-    import jev_contracts as contracts_module
-    import jev_projection as projection_module
+    global projection, contracts
+    with linked_harness():
+        import jev_contracts as contracts_module
+        import jev_projection as projection_module
     contracts = contracts_module
     projection = projection_module
-
-
-def tearDownModule():
-    if _ORIGINAL_IMG2_HOME is None:
-        os.environ.pop("IMG2_HOME", None)
-    else:
-        os.environ["IMG2_HOME"] = _ORIGINAL_IMG2_HOME
-    if _TEST_HOME is not None:
-        shutil.rmtree(_TEST_HOME, ignore_errors=True)
-    sys.path.remove(str(PLUGIN_DIR / "tools"))
-    sys.path.remove(str(HARNESS_DIR))
 
 
 class ProjectionTests(unittest.TestCase):

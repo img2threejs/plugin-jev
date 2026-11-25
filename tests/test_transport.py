@@ -21,7 +21,9 @@ def setUpModule():
     sys.path.insert(0, str(PLUGIN / "tools"))
     spec = importlib.util.spec_from_file_location("jev_transport_test", PLUGIN / "tools/jev_transport.py")
     transport = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(transport)
+    from _harness import linked_harness
+    with linked_harness():
+        spec.loader.exec_module(transport)
 
 
 def tearDownModule():

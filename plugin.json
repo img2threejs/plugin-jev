@@ -1,8 +1,15 @@
 {
   "schema": 1,
   "name": "jev",
-  "version": "0.3.0",
-  "description": "Advisory checkpoint consultation and repair routing from structured img2 evidence using Jev TypeSafe; neither has acceptance authority.",
-  "capabilities": [{ "from": "repair-state", "to": "repair-recommendation" }, { "from": "img2.jev-checkpoint-context", "to": "img2.jev-checkpoint-advisory" }],
+  "version": "0.5.0",
+  "description": "Bounded four-purpose image-aware decision advisories plus legacy Environment checkpoint and repair advice; never acceptance authority.",
+  "capabilities": [
+    { "from": "repair-state", "to": "repair-recommendation" },
+    { "from": "img2.jev-checkpoint-context", "to": "img2.jev-checkpoint-advisory" },
+    { "from": "img2.route-context", "to": "img2.route-advisory" },
+    { "from": "img2.build-strategy-context", "to": "img2.build-strategy-advisory" },
+    { "from": "img2.quality-review-context", "to": "img2.quality-review-advisory" },
+    { "from": "img2.repair-context", "to": "img2.repair-advisory" }
+  ],
   "requires": { "harness": ">=0.2.5", "coreApi": 1 }
 }

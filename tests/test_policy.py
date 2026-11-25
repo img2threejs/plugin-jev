@@ -1,38 +1,16 @@
-import importlib.util
-import os
-import shutil
-import sys
-import tempfile
 import unittest
-from pathlib import Path
 
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
-HARNESS_DIR = Path(os.environ.get("IMG2_HARNESS_DIR", PLUGIN_DIR.parent / "img2")).resolve()
-_ORIGINAL_IMG2_HOME = os.environ.get("IMG2_HOME")
-_TEST_HOME = None
+from _harness import linked_harness
+
 policy = None
+
+
 def setUpModule():
-    global _TEST_HOME, policy
-    if _ORIGINAL_IMG2_HOME is None:
-        _TEST_HOME = Path(tempfile.mkdtemp(prefix="jev-policy-img2-home-"))
-        (_TEST_HOME / "harness").symlink_to(HARNESS_DIR)
-        os.environ["IMG2_HOME"] = str(_TEST_HOME)
-
-    spec = importlib.util.spec_from_file_location("jev_policy", PLUGIN_DIR / "tools" / "jev_policy.py")
-    assert spec is not None and spec.loader is not None
-    policy = importlib.util.module_from_spec(spec)
-    sys.modules["jev_policy"] = policy
-    spec.loader.exec_module(policy)
-
-
-def tearDownModule():
-    if _ORIGINAL_IMG2_HOME is None:
-        os.environ.pop("IMG2_HOME", None)
-    else:
-        os.environ["IMG2_HOME"] = _ORIGINAL_IMG2_HOME
-    if _TEST_HOME is not None:
-        shutil.rmtree(_TEST_HOME, ignore_errors=True)
+    global policy
+    with linked_harness():
+        import jev_policy as module
+    policy = module
 
 
 

@@ -61,3 +61,29 @@ def resolve_api_key(environ=None):
     if not key:
         raise CredentialError("macOS Keychain credential is missing or could not be read")
     return key
+
+
+def auth_status(environ=None):
+    """Inspect local credentials only; never return a key or storage diagnostics."""
+    environ = os.environ if environ is None else environ
+    override = environ.get("TYPESAFE_API_KEY", "")
+    if isinstance(override, str) and override.strip():
+        return {"status": "present", "reasonCode": "credential-present"}
+    try:
+        security = _security_path()
+        result = subprocess.run(
+            [security, "find-generic-password", "-a", ACCOUNT, "-s", SERVICE, "-w"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (CredentialError, OSError, subprocess.SubprocessError, UnicodeError):
+        return {"status": "storage-error", "reasonCode": "credential-storage-error"}
+    # security(1) uses 44 for errSecItemNotFound; denial, cancellation and an
+    # inaccessible Keychain must never be reported as an absent enrollment.
+    if result.returncode == 44:
+        return {"status": "missing", "reasonCode": "credential-missing"}
+    if result.returncode != 0 or not result.stdout.strip():
+        return {"status": "storage-error", "reasonCode": "credential-storage-error"}
+    return {"status": "present", "reasonCode": "credential-present"}

@@ -1,0 +1,3 @@
+# Optional plugin-only dependency for consented decision-image preparation.
+# Base and text-only authentication/transport remain standard-library-only.
+Pillow>=10.0.0,<13

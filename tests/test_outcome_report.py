@@ -1,45 +1,25 @@
 import hashlib
-import importlib.util
+import importlib
 import json
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-PLUGIN_DIR = Path(__file__).resolve().parent.parent
-HARNESS_DIR = Path(os.environ.get("IMG2_HARNESS_DIR", PLUGIN_DIR.parent / "img2")).resolve()
-_TEST_HOME = None
+from _harness import linked_harness
 
+PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
-sys.path.insert(0, str(PLUGIN_DIR / "tools"))
 
 def setUpModule():
-    global _TEST_HOME
-    if not os.environ.get("IMG2_HOME"):
-        _TEST_HOME = Path(tempfile.mkdtemp(prefix="jev-report-img2-home-"))
-        (_TEST_HOME / "harness").symlink_to(HARNESS_DIR)
-        os.environ["IMG2_HOME"] = str(_TEST_HOME)
-    for name in ("jev_policy", "jev_contracts", "jev_outcome_report"):
-        spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "tools" / f"{name}.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
+    with linked_harness():
+        for name in ("jev_policy", "jev_contracts", "jev_outcome_report"):
+            importlib.import_module(name)
 
 
 reporter = None
 contracts = None
-
-
-def tearDownModule():
-    if _TEST_HOME:
-        import shutil
-        os.environ.pop("IMG2_HOME", None)
-        shutil.rmtree(_TEST_HOME)
-    sys.path.remove(str(PLUGIN_DIR / "tools"))
-
 
 
 class OutcomeReportTests(unittest.TestCase):
