@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import math
+from fractions import Fraction
 
 POLICY = "native-character-material-policy-v1"
 QUESTIONS = "character-material-questions-v1"
@@ -16,6 +17,10 @@ LIGHTING = {"importedLights": "hidden", "hemisphere": {"skyColor": 16777215, "gr
 RENDERER = {"name": "threejs", "outputColorSpace": "srgb", "toneMapping": "none", "alpha": True,
             "antialias": False, "pixelRatio": 1, "clearColor": [0,0,0,0]}
 MAX_FILE = 64 * 1024 * 1024
+# Conservative high-precision tan(pi / 1_800_000), not platform libm tan().
+# Exact binary input ratios are compared without a rounded float product.
+_CARDINAL_TANGENT_LIMIT = Fraction(
+    "0.000001745329251996101769235095523883187161576424021017426890222381176966998031245926821774128")
 
 
 class MaterialEvidenceError(ValueError):
@@ -91,11 +96,11 @@ def physical_view(matrix):
     _need(math.hypot(matrix[8], matrix[10]) > 1e-12)
     angle = math.degrees(math.atan2(matrix[8], matrix[10]))
     view = int(round(angle / 90)) % 4 * 90
-    # Compare in the exact cardinal basis: converting to degrees first rounds
-    # an on-boundary 1e-4 value upward. No epsilon or tolerance widening.
+    # atan2 selects only the cardinal quadrant. The tolerance comparison uses
+    # exact input ratios and a fixed bound; libm and product rounding cannot widen it.
     x, z = matrix[8], matrix[10]
     dot, cross = ((z, x), (x, -z), (-z, -x), (-x, z))[view // 90]
-    _need(dot > 0 and abs(cross) <= dot * math.tan(math.radians(1e-4)))
+    _need(dot > 0 and Fraction(abs(cross)) <= Fraction(dot) * _CARDINAL_TANGENT_LIMIT)
     return view
 
 

@@ -97,13 +97,24 @@ class CharacterMaterialAdmissionTests(unittest.TestCase):
     def test_cardinal_tolerance_is_inclusive_and_not_automatically_relaxed(self):
         with tempfile.TemporaryDirectory() as directory:
             source, _ = material_fixture(directory)
-            for delta, accepted in [(0, True), (0.0000999, True), (0.0001, True),
-                                    (-0.0001, True), (0.0001001, False)]:
+            # Encoded boundary and captured legacy sin/cos endpoint: runtime
+            # libm results differ by one ULP across Darwin and glibc.
+            limit = float.fromhex("0x1.d4821ce8edb03p-20")
+            legacy_x = float.fromhex("0x1.d4821ce8ea9fbp-20")
+            legacy_z = float.fromhex("0x1.fffffffffca69p-1")
+            inside, outside = math.radians(0.0000999), math.radians(0.0001001)
+            cases = [("zero", 0, 1, True),
+                     ("inside", math.sin(inside), math.cos(inside), True),
+                     ("positive-boundary", limit, 1, True),
+                     ("negative-boundary", -limit, 1, True),
+                     ("legacy-positive-rounds-outside", legacy_x, legacy_z, False),
+                     ("legacy-negative-rounds-outside", -legacy_x, legacy_z, False),
+                     ("outside", math.sin(outside), math.cos(outside), False)]
+            for name, cross, dot, accepted in cases:
                 context = copy.deepcopy(source)
-                theta = math.radians(delta)
                 matrix = context["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"]
-                matrix[8], matrix[10] = math.sin(theta), math.cos(theta)
-                with self.subTest(delta=delta):
+                matrix[8], matrix[10] = cross, dot
+                with self.subTest(name=name):
                     if accepted:
                         self.assertEqual(len(build_questions(context)), 7)
                     else:
@@ -113,7 +124,7 @@ class CharacterMaterialAdmissionTests(unittest.TestCase):
     def test_cardinal_boundary_rejects_one_float_step_outside(self):
         with tempfile.TemporaryDirectory() as directory:
             source, _ = material_fixture(directory)
-            limit = math.tan(math.radians(1e-4))
+            limit = float.fromhex("0x1.d4821ce8edb03p-20")
             for cross, accepted in [(limit, True), (math.nextafter(limit, math.inf), False)]:
                 context = copy.deepcopy(source)
                 matrix = context["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"]

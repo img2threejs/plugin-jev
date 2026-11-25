@@ -15,6 +15,8 @@
   updates or implicit compatibility aliases.
 - Reject collapsed/dependent material camera world bases before compiling questions or
   provider preflight; normalize the basis-volume check to preserve nonsingular camera scaling.
+- Make the cardinal boundary platform-independent with an exact-ratio comparison; retain
+  rounded-outside sine/cosine vectors as negative cases rather than widening the tolerance.
 
 ### Fixed in 0.4.0
 

@@ -269,6 +269,11 @@ normalized fractions including 0 and 1. Every clip/time independently requires a
 physical camera directions, exactly once. Directions derive from matrixWorld +Z back,
 with inclusive 1e-4 degree angular tolerance compared in the exact cardinal basis;
 there is no epsilon widening, label-based substitute or static-view compensation.
+The angular comparison uses exact binary input ratios and a fixed conservative rational
+tangent bound for pi/1,800,000, not platform libm tan() or a rounded float product.
+The largest valid encoded boundary slope is 0x1.d4821ce8edb03p-20; its next float
+is outside. Nominal sine/cosine generation can round outside the physical limit
+and is not an admission exception.
 Before classification, every world-basis column must have length >1e-12 and the absolute
 scalar triple product of the individually normalized columns must be >1e-12. Zero,
 dependent, coplanar or numerically collapsed bases refuse before question compilation
