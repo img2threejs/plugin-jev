@@ -269,6 +269,11 @@ normalized fractions including 0 and 1. Every clip/time independently requires a
 physical camera directions, exactly once. Directions derive from matrixWorld +Z back,
 with inclusive 1e-4 degree angular tolerance compared in the exact cardinal basis;
 there is no epsilon widening, label-based substitute or static-view compensation.
+Before classification, every world-basis column must have length >1e-12 and the absolute
+scalar triple product of the individually normalized columns must be >1e-12. Zero,
+dependent, coplanar or numerically collapsed bases refuse before question compilation
+and provider preflight; nonsingular scaling/roll/reflection are not rejected merely
+because the basis is not a unit rigid transform. Cardinal tolerance remains unchanged.
 
 Frame records have exactly index, role, sha256, rgbaRole, rgbaSha256, width, height,
 clipId, time, side, azimuth, camera and roi. Index is contiguous; role is render for zero,

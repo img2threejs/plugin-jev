@@ -23,6 +23,27 @@ import jev_decision_provider as provider
 import test_decision_enrollment as enrollment
 
 
+def _world(right, up, back):
+    return [*right, 0, *up, 0, *back, 0, 11, 7, -3, 1]
+
+
+DEGENERATE_WORLDS = [
+    ("zero-right", _world((0,0,0), (0,1,0), (0,0,1))),
+    ("zero-up", _world((1,0,0), (0,0,0), (0,0,1))),
+    ("parallel", _world((1,0,0), (2,0,0), (0,0,1))),
+    ("coplanar", _world((1,0,0), (1,0,1), (0,0,1))),
+    ("nearly-parallel", _world((1,0,0), (1,1e-14,0), (0,0,1))),
+    ("collapsed-right", _world((1e-14,0,0), (0,1,0), (0,0,1))),
+]
+VALID_WORLDS = [
+    _world((1,0,0), (0,1,0), (0,0,1)),
+    _world((0,2,0), (-3,0,0), (0,0,4)),
+    _world((2,0,0), (0.5,3,0), (0,0,4)),
+    _world((-2,0,0), (0,3,0), (0,0,4)),
+    _world((1e-5,0,0), (0,1e-5,0), (0,0,1e-5)),
+]
+
+
 class CharacterMaterialAdmissionTests(unittest.TestCase):
     def test_native_character_requires_material_provenance(self):
         for deterministic in ({}, {"sweep": {"materialCapture": "original-material-fixed-lighting-v1"}}):
@@ -103,6 +124,30 @@ class CharacterMaterialAdmissionTests(unittest.TestCase):
                     with self.assertRaises(DecisionQuestionError):
                         build_questions(context)
 
+    def test_degenerate_camera_bases_refuse_question_compilation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, _ = material_fixture(directory)
+            for name, matrix in DEGENERATE_WORLDS:
+                context = copy.deepcopy(source)
+                context["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"] = matrix
+                with self.subTest(name=name), self.assertRaises(DecisionQuestionError):
+                    build_questions(context)
+
+    def test_degenerate_camera_bases_refuse_before_provider_or_reservation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, assets = material_fixture(directory)
+            response = response_for(source)
+            for name, matrix in DEGENERATE_WORLDS:
+                context = copy.deepcopy(source)
+                context["observations"]["characterMaterial"]["frames"][0]["camera"]["matrixWorld"] = matrix
+                reserve = mock.Mock()
+                with self.subTest(name=name), mock.patch.object(
+                        provider, "post_systemone", return_value=response) as post:
+                    with self.assertRaises(DecisionQuestionError):
+                        provider.evaluate_context(context, api_key=KEY, assets=assets, before_send=reserve)
+                    reserve.assert_not_called()
+                    post.assert_not_called()
+
 
 class CharacterMaterialFileTests(_WorkspaceFixture):
     def setUp(self):
@@ -116,6 +161,58 @@ class CharacterMaterialFileTests(_WorkspaceFixture):
         with linked_harness():
             spec.loader.exec_module(self.cli)
         self.context, self.assets = material_fixture(self.workspace)
+
+    def _rewrite_world(self, context, matrix):
+        frame = context["observations"]["characterMaterial"]["frames"][0]
+        binding = next(item for item in context["bindings"] if item["role"] == frame["camera"]["role"])
+        record = json.loads((self.workspace / binding["path"]).read_text())
+        record["matrixWorld"] = matrix
+        frame["camera"]["matrixWorld"] = matrix
+        frame["camera"]["sha256"] = rewrite_binding(self.workspace, context, binding["role"], record)
+        sync_manifest(self.workspace, context)
+
+    def test_fresh_hash_degenerate_camera_refuses_file_preflight_and_cli(self):
+        self.grant(128000)
+        response = response_for(self.context)
+        import jev_decision_transport as transport
+        for name, matrix in DEGENERATE_WORLDS:
+            context = copy.deepcopy(self.context)
+            self._rewrite_world(context, matrix)
+            with self.subTest(name=name):
+                with self.assertRaises(DecisionQuestionError):
+                    self.cli._decision_bindings(self.workspace, context, self.assets)
+                (self.workspace / "context.json").write_bytes(canonical(context))
+                (self.workspace / "assets.json").write_bytes(canonical(self.assets))
+                with mock.patch.object(self.cli, "auth_status", return_value={"status": "present"}) as auth, \
+                        mock.patch.object(self.cli, "resolve_api_key", return_value=KEY) as key, \
+                        mock.patch.object(transport, "_run_worker", return_value=response) as worker:
+                    code, result = enrollment.DecisionCliTests.invoke(self, "quality-review")
+                    self.assertEqual(code, 2)
+                    self.assertEqual(result["reasonCode"], "invalid-material-evidence")
+                    self.assertEqual((result["sendState"], result["chargedTokens"]), ("not-sent", 0))
+                    auth.assert_not_called()
+                    key.assert_not_called()
+                    worker.assert_not_called()
+
+    def test_valid_scaled_rolled_and_translated_camera_bases_remain_usable(self):
+        for index, matrix in enumerate(VALID_WORLDS):
+            context = copy.deepcopy(self.context)
+            self._rewrite_world(context, matrix)
+            with self.subTest(index=index):
+                self.assertEqual(len(build_questions(context)), 7)
+                self.cli._decision_bindings(self.workspace, context, self.assets)
+        self.grant(128000)
+        (self.workspace / "context.json").write_bytes(canonical(context))
+        (self.workspace / "assets.json").write_bytes(canonical(self.assets))
+        import jev_decision_transport as transport
+        with mock.patch.object(self.cli, "auth_status", return_value={"status": "present"}), \
+                mock.patch.object(self.cli, "resolve_api_key", return_value=KEY), \
+                mock.patch.object(transport, "_run_worker", return_value=response_for(context)) as worker:
+            code, result = enrollment.DecisionCliTests.invoke(self, "quality-review")
+            self.assertEqual(code, 0)
+            self.assertEqual((result["status"], result["sendState"], result["chargedTokens"]),
+                             ("answered", "charged", 168))
+            worker.assert_called_once()
 
     def test_source_rgba_mismatch_refuses_even_with_fresh_hashes(self):
         frame = self.context["observations"]["characterMaterial"]["frames"][0]

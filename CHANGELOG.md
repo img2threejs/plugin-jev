@@ -13,6 +13,8 @@
   producer attestation, replay, installation and paired host-ledger qualification remain core-owned.
 - Advance manifest, repair CLI and checkpoint artifact version together to 0.5.0; no core/img2 pin
   updates or implicit compatibility aliases.
+- Reject collapsed/dependent material camera world bases before compiling questions or
+  provider preflight; normalize the basis-volume check to preserve nonsingular camera scaling.
 
 ### Fixed in 0.4.0
 

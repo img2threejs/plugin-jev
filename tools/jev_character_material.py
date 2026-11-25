@@ -74,6 +74,20 @@ def _ids(values, maximum=32):
 def physical_view(matrix):
     _need(type(matrix) is list and len(matrix) == 16 and all(_number(item) for item in matrix))
     _need(matrix[3] == matrix[7] == matrix[11] == 0 and matrix[15] == 1)
+    # A valid back direction alone does not make the full camera invertible.
+    # Normalize columns before the volume test so ordinary camera scaling is
+    # not confused with nearly dependent axes.
+    basis = []
+    for offset in (0, 4, 8):
+        column = matrix[offset:offset+3]
+        length = math.hypot(*column)
+        _need(length > 1e-12)
+        basis.append(tuple(value / length for value in column))
+    right, up, back = basis
+    volume = (right[0] * (up[1]*back[2] - up[2]*back[1])
+              - right[1] * (up[0]*back[2] - up[2]*back[0])
+              + right[2] * (up[0]*back[1] - up[1]*back[0]))
+    _need(abs(volume) > 1e-12)
     _need(math.hypot(matrix[8], matrix[10]) > 1e-12)
     angle = math.degrees(math.atan2(matrix[8], matrix[10]))
     view = int(round(angle / 90)) % 4 * 90
